@@ -6,9 +6,14 @@
     "relay"
   ],
   "scripts": {
-    "build": "npm --prefix extension run compile",
-    "package": "npm --prefix extension run package",
-    "start:relay": "npm --prefix relay run start",
-    "dev:relay": "npm --prefix relay run dev"
+    "build": "npm run build:extension",
+    "build:extension": "npm --prefix extension run compile",
+    "package": "npm run package:extension",
+    "package:extension": "npm --prefix extension run package",
+    "relay:start": "npm --prefix relay run start",
+    "relay:dev": "npm --prefix relay run dev",
+    "relay:test:e2e": "npm --prefix relay run test:e2e",
+    "start:relay": "npm run relay:start",
+    "dev:relay": "npm run relay:dev"
   }
 }

@@ -3,7 +3,7 @@ export type JoinMessage = {
   session: string;
   peerName: string;
   secret?: string;
-  password: string; // verifier hash
+  password: string; // verifier hash derived from session secret
   clientToken: string;
 };
 
@@ -37,6 +37,8 @@ export type SnapshotChunkMsg = {
   id: string;
   chunk: number;
   total: number;
+  totalBytes: number;
+  sha256: string;
   dataB64: string;
 };
 

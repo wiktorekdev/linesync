@@ -1,11 +1,13 @@
 {
   "name": "linesync-relay",
   "version": "1.0.0",
-  "description": "LineSync relay server — routes sync messages between VS Code peers",
+  "description": "LineSync relay server - secure session routing for VS Code peers",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "smoke": "node --check index.js",
+    "test:e2e": "node test/e2e.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

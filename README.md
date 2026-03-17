@@ -47,13 +47,12 @@ No branches. No merge ceremonies. Just open a session and start coding together.
 
 **As the host:**
 1. Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and run `LineSync: Start New Session`.
-2. Share the **session code** and **password** with your collaborator.
-   > Alternatively, copy the **join token** (`SESSIONCODE.PASSWORD`) — your collaborator can paste it as-is and LineSync will fill in both fields automatically.
+2. LineSync auto-generates a secret and copies a **session token** to your clipboard.
+3. Share that token with your collaborator.
 
 **As the guest:**
 1. Run `LineSync: Join Session` from the Command Palette.
-2. Paste the session code or the full join token.
-3. Enter the password if it wasn't included in the token.
+2. Paste the session token.
 
 That's it — you're live.
 
@@ -72,7 +71,6 @@ Add any of these to your VS Code `settings.json`:
     "wss://linesync-sg.onrender.com"
   ],
   "linesync.userName": "YourName",
-  "linesync.mergePolicy": "prompt",
   "linesync.relaySecret": "",
   "linesync.maxFileSizeKB": 512,
   "linesync.ignorePatterns": []
@@ -84,7 +82,6 @@ Add any of these to your VS Code `settings.json`:
 | `linesync.relayUrl` | WebSocket URL of the relay to use, or `"auto"` to pick the lowest-latency one automatically. |
 | `linesync.relayUrls` | List of relay candidates evaluated when `relayUrl` is `"auto"`. |
 | `linesync.userName` | Display name shown to other participants in a session. |
-| `linesync.mergePolicy` | What to do when auto-merge fails. Default: `"prompt"`. |
 | `linesync.relaySecret` | Optional shared secret for connecting to a private relay. |
 | `linesync.maxFileSizeKB` | Files larger than this (in KB) are skipped during sync. |
 | `linesync.ignorePatterns` | Additional glob patterns or folder paths to exclude from sync. |
@@ -107,13 +104,13 @@ Community-hosted relays are listed in [COMMUNITY_RELAYS.md](COMMUNITY_RELAYS.md)
 
 ## Sessions & Encryption
 
-Every session is identified by a **session code** (e.g. `ABCDEF`) and protected by a **password** you set when starting the session.
+Every session is protected by a generated secret represented as a single **session token**.
 
-- File sync messages are encrypted end-to-end with **AES-GCM** using a key derived from the session password. The relay cannot read file contents.
-- The password is never sent to the relay in plaintext — only a derived hash (verifier) is used to authenticate participants.
-- The **join token** format is `SESSIONCODE.PASSWORD`. Pasting it into the code prompt auto-fills both fields.
+- File sync messages are encrypted end-to-end with **AES-GCM** using a key derived from the session secret. The relay cannot read file contents.
+- The raw secret is never sent to the relay in plaintext — only a derived hash (verifier) is used to authenticate participants.
+- Guests join using one opaque session token.
 
-> **Use a strong password.** The relay cannot see your files, but a weak password could be vulnerable to offline brute-force against the public verifier hash.
+> Keep session tokens private. Anyone with the token can join.
 
 ---
 
@@ -124,11 +121,11 @@ LineSync uses a relay to connect peers. Even with encryption, the relay is a net
 **What the relay can see:**
 - Your IP address and basic connection metadata
 - Message timing and approximate sizes
-- Session codes
+- Session identifiers
 
 **What the relay cannot see:**
 - File contents (encrypted client-side before transmission)
-- Your raw session password
+- Your raw session secret
 
 **Out of scope:** Message metadata (timing, sizes) is not obfuscated. If traffic pattern analysis is a concern, run a private relay on infrastructure you control.
 

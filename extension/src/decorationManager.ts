@@ -27,7 +27,10 @@ function rgbaFromBase(base: string, alpha: number): string {
 
 function getDecorConfig() {
   const cfg = vscode.workspace.getConfiguration('linesync');
-  const style = (cfg.get<string>('peerDecorationsStyle') ?? 'git') as PeerDecorationsStyle;
+  const styleRaw = cfg.get<string>('peerDecorationsStyle', 'git');
+  const style: PeerDecorationsStyle = styleRaw === 'full' || styleRaw === 'minimal' || styleRaw === 'git'
+    ? styleRaw
+    : 'git';
   const showChangedLabel = cfg.get<boolean>('peerShowChangedLineLabel') ?? false;
   const showCursorLabel = cfg.get<boolean>('peerShowCursorLabel') ?? true;
   const showCursorCoords = cfg.get<boolean>('peerShowCursorCoords') ?? true;
@@ -240,7 +243,7 @@ export class DecorationManager {
       });
     }
 
-    // Cursor: inline marker at the exact character.
+    // Cursor: inline marker at the exact character (visible `|` like native caret).
     peer.cursorInlineType = vscode.window.createTextEditorDecorationType({
       before: {
         contentText: '|',
@@ -252,7 +255,7 @@ export class DecorationManager {
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     });
 
-    // Cursor fallback for empty lines: whole-line marker at line start
+    // Cursor fallback for empty lines: whole-line marker at line start.
     peer.cursorLineType = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       before: {
@@ -270,13 +273,13 @@ export class DecorationManager {
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     });
 
-    const selectionBg = rgbaFromBase(c.bg, cfg.selectionOpacity);
     peer.selectionType = vscode.window.createTextEditorDecorationType({
-      backgroundColor: selectionBg,
-      borderColor: cfg.style === 'minimal' ? undefined : c.cursor,
-      borderStyle: cfg.style === 'minimal' ? undefined : 'solid',
-      borderWidth: cfg.style === 'minimal' ? undefined : '1px',
-      borderRadius: '1px',
+      // Subtle “box” around the peer selection, centered on the selected range.
+      backgroundColor: rgbaFromBase(c.bg, cfg.selectionOpacity),
+      borderColor: c.cursor,
+      borderStyle: 'solid',
+      borderWidth: '1px',
+      borderRadius: '2px',
     });
   }
 
@@ -314,7 +317,7 @@ export class DecorationManager {
             range: new vscode.Range(l, ch, l, ch),
             renderOptions: {
               after: {
-                contentText: ` | ${label}`,
+                contentText: `  ${label}`,
                 color: PALETTE[peer.colorIdx % PALETTE.length].label,
                 margin: '0 0 0 4px',
               },

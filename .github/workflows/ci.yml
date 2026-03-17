@@ -37,5 +37,8 @@ jobs:
         run: npm ci --workspaces=false
         working-directory: relay
       - name: Smoke
-        run: node --check index.js
+        run: npm run smoke
+        working-directory: relay
+      - name: E2E
+        run: npm run test:e2e
         working-directory: relay

@@ -1,7 +1,7 @@
 {
     "name":  "linesync",
     "displayName":  "LineSync",
-    "description":  "Live file sync between peers - no commits, no branches, instant collaboration",
+    "description":  "Premium live collaboration for code - instant peer sync without branches or commits",
     "version":  "0.1.0",
     "publisher":  "wiktorekdev",
     "engines":  {
@@ -14,15 +14,19 @@
                              "onCommand:linesync.startSession",
                              "onCommand:linesync.joinSession",
                              "onCommand:linesync.disconnect",
+                             "onCommand:linesync.copySessionInvite",
                              "onCommand:linesync.showMenu",
-                             "onCommand:linesync.openSettings"
+                             "onCommand:linesync.openSettings",
+                             "onCommand:linesync.followPeer",
+                             "onCommand:linesync.resyncFile",
+                             "onCommand:linesync.explainIgnore"
                          ],
     "main":  "./out/extension.js",
     "contributes":  {
-                        "commands":  [
+        "commands":  [
                                          {
                                              "command":  "linesync.startSession",
-                                             "title":  "LineSync: Start New Session",
+                                             "title":  "LineSync: Start Session",
                                              "icon":  "$(broadcast)"
                                          },
                                          {
@@ -36,21 +40,41 @@
                                              "icon":  "$(circle-slash)"
                                          },
                                          {
-                                             "command":  "linesync.showMenu",
-                                             "title":  "LineSync: Menu"
+                                             "command":  "linesync.copySessionInvite",
+                                             "title":  "LineSync: Copy Session Token",
+                                             "icon":  "$(mail)"
                                          },
                                          {
-                                             "command":  "linesync.openSettings",
-                                             "title":  "LineSync: Settings"
-                                         }
-                                     ],
-                        "configuration":  {
+                                             "command":  "linesync.showMenu",
+                                             "title":  "LineSync: Open Menu"
+                                         },
+                                        {
+                                            "command":  "linesync.openSettings",
+                                            "title":  "LineSync: Open Settings"
+                                        },
+                                        {
+                                            "command": "linesync.followPeer",
+                                            "title": "LineSync: Follow Peer",
+                                            "icon": "$(eye)"
+                                        },
+                                        {
+                                            "command": "linesync.resyncFile",
+                                            "title": "LineSync: Resync Current File",
+                                            "icon": "$(sync)"
+                                        },
+                                        {
+                                            "command": "linesync.explainIgnore",
+                                            "title": "LineSync: Explain Ignore",
+                                            "icon": "$(question)"
+                                        }
+                                    ],
+        "configuration":  {
                                               "title":  "LineSync",
                                               "properties":  {
                                                                  "linesync.relayUrl":  {
                                                                                            "type":  "string",
                                                                                            "default":  "",
-                                                                                           "markdownDescription":  "WebSocket URL of your relay server, e.g. `wss://my-relay.onrender.com`. Use `auto` to select from `linesync.relayUrls`."
+                                                                                           "markdownDescription":  "Relay WebSocket URL, e.g. `wss://my-relay.onrender.com`. Set `auto` to pick the lowest-latency entry from `linesync.relayUrls`."
                                                                                        },
                                                                  "linesync.relayUrls":  {
                                                                                             "type":  "array",
@@ -62,53 +86,48 @@
                                                                                                             "wss://linesync-de.onrender.com",
                                                                                                             "wss://linesync-sg.onrender.com"
                                                                                                         ],
-                                                                                            "markdownDescription":  "Optional list of relay URLs. If set, LineSync can auto-select the lowest-latency relay. Use `linesync.relayUrl` = `auto` to force auto selection."
+                                                                                            "markdownDescription":  "Relay candidates used when `linesync.relayUrl` is set to `auto`."
                                                                                         },
                                                                  "linesync.relaySecret":  {
                                                                                               "type":  "string",
                                                                                               "default":  "",
-                                                                                              "markdownDescription":  "Shared secret for the relay server. Must match `RELAY_SECRET` env var on the server. Leave empty if the server has no auth."
+                                                                                              "markdownDescription":  "Optional relay access secret. Must match the relay `RELAY_SECRET` value."
                                                                                           },
                                                                  "linesync.userName":  {
                                                                                            "type":  "string",
                                                                                            "default":  "",
-                                                                                           "description":  "Your display name shown to peers. Leave empty to use a generated ID."
+                                                                                           "description":  "Display name shown to peers. Leave empty to use an anonymous generated alias."
                                                                                        },
-                                                                 "linesync.highlightDuration":  {
-                                                                                                    "type":  "number",
-                                                                                                    "default":  5000,
-                                                                                                    "description":  "How long (ms) to highlight lines changed by a peer."
-                                                                                                },
                                                                  "linesync.peerDecorationsStyle": {
                                                                                                    "type": "string",
                                                                                                    "default": "git",
                                                                                                    "enum": ["full", "git", "minimal"],
-                                                                                                   "description": "How peer decorations look. full = background highlights, git = subtle gutter/ruler, minimal = cursor/selection only."
+                                                                                                   "description": "Peer decoration style. full = full-line, git = subtle gutter/ruler, minimal = cursor/selection only."
                                                                                                  },
                                                                  "linesync.peerShowChangedLineLabel": {
                                                                                                    "type": "boolean",
                                                                                                    "default": false,
-                                                                                                   "description": "Show a '<- name' label on lines highlighted as changed by a peer."
+                                                                                                   "description": "Show peer name on changed-line highlights."
                                                                                                  },
                                                                  "linesync.peerShowCursorLabel": {
                                                                                                    "type": "boolean",
                                                                                                    "default": true,
-                                                                                                   "description": "Show peer name next to the cursor marker."
+                                                                                                   "description": "Show peer name next to cursor marker."
                                                                                                  },
                                                                  "linesync.peerShowCursorCoords": {
                                                                                                    "type": "boolean",
                                                                                                    "default": true,
-                                                                                                   "description": "Show cursor coordinates (line:col) next to the peer cursor."
+                                                                                                   "description": "Show cursor coordinates (line:col) next to peer cursor."
                                                                                                  },
                                                                  "linesync.peerSelectionOpacity": {
                                                                                                    "type": "number",
                                                                                                    "default": 0.12,
-                                                                                                   "description": "Opacity for peer selection highlight (0.0 - 0.5 recommended)."
+                                                                                                   "description": "Peer-selection highlight opacity (0.0 - 0.5 recommended)."
                                                                                                  },
                                                                  "linesync.maxFileSizeKB":  {
                                                                                                 "type":  "number",
                                                                                                 "default":  512,
-                                                                                                "markdownDescription":  "Files larger than this (in KB) are **skipped** during sync. Default: 512 KB. Increase if you need to sync large generated files."
+                                                                                                "markdownDescription":  "Soft live-sync limit in KB. Larger files use snapshot flow instead of continuous text sync."
                                                                                             },
                                                                  "linesync.ignorePatterns":  {
                                                                                                  "type":  "array",
@@ -154,34 +173,18 @@
                                                                                                                 "*.ttf",
                                                                                                                 "*.otf"
                                                                                                             ],
-                                                                                                 "description":  "Folder/file patterns to exclude from sync."
-                                                                                             },
-                                                                 "linesync.mergePolicy":  {
-                                                                                              "type":  "string",
-                                                                                              "default":  "prompt",
-                                                                                              "enum":  [
-                                                                                                           "prompt",
-                                                                                                           "preferMine",
-                                                                                                           "preferTheirs",
-                                                                                                           "preferHost"
-                                                                                                       ],
-                                                                                              "markdownDescription":  "Conflict resolution policy when auto-merge fails. `prompt` shows the UI, `preferMine` keeps your version, `preferTheirs` accepts remote, `preferHost` keeps host\u0027s version."
+                                                                                                 "description":  "Folder/file patterns excluded from sync and snapshot requests."
                                                                                           }
                                                              }
                                           },
-                        "menus":  {
-                                      "editor/title":  [
-                                                           {
-                                                               "command":  "linesync.startSession",
-                                                               "group":  "navigation",
-                                                               "when":  "!linesync.active"
-                                                           },
-                                                           {
-                                                               "command":  "linesync.disconnect",
-                                                               "group":  "navigation",
-                                                               "when":  "linesync.active"
-                                                           }
-                                                       ],
+        "menus":  {
+                                      "editor/title": [
+                                        {
+                                          "command": "linesync.followPeer",
+                                          "group": "navigation",
+                                          "when": "linesync.active"
+                                        }
+                                      ],
                                       "explorer/context": [
                                         {
                                           "command": "linesync.resyncFile",

@@ -6,12 +6,39 @@ import * as Y from 'yjs';
 import { DocStore } from './docStore';
 import { Presence } from './presence';
 import { DecorationManager } from './decorationManager';
+import { IgnoreMatcher } from './ignoreMatcher';
 import type { Transport, TransportEvent } from './transport';
 import type { Payload } from './protocol';
 
-type SnapshotRecv = {
+const SNAPSHOT_CHUNK_BYTES = 32 * 1024;
+const SNAPSHOT_SEND_WINDOW = 8;
+const SNAPSHOT_RETRY_MS = 1200;
+const SNAPSHOT_MAX_RETRIES = 6;
+const SNAPSHOT_RECV_TTL_MS = 45_000;
+const SNAPSHOT_MAX_ACTIVE_RECV_BYTES = 32 * 1024 * 1024;
+
+type SnapshotSendState = {
+  file: string;
+  id: string;
+  data: Buffer;
   total: number;
-  received: Map<number, string>;
+  totalBytes: number;
+  sha256: string;
+  nextChunk: number;
+  acked: Set<number>;
+  inFlight: Map<number, { sentAt: number; tries: number }>;
+  retryTimer: ReturnType<typeof setInterval> | null;
+};
+
+type SnapshotRecvState = {
+  file: string;
+  id: string;
+  total: number;
+  totalBytes: number;
+  sha256: string;
+  received: Map<number, Buffer>;
+  receivedBytes: number;
+  lastAt: number;
 };
 
 function toRel(root: string, fsPath: string): string | null {
@@ -48,8 +75,13 @@ export class SyncEngine {
   private suppressEditorToDoc = new Set<string>();
   private maxFileSizeBytes: number;
 
-  private pendingSnapshotChunks = new Map<string, { tries: number; msg: any; timer: ReturnType<typeof setTimeout> }>();
-  private snapshotRecv = new Map<string, SnapshotRecv>(); // id -> recv
+  private snapshotSends = new Map<string, SnapshotSendState>();
+  private snapshotRecv = new Map<string, SnapshotRecvState>(); // file|id -> recv
+  private snapshotRecvBytes = 0;
+  private lastSnapshotRequestAt = new Map<string, number>();
+  private trackedFiles = new Set<string>();
+  private untrackFileListeners = new Map<string, () => void>();
+  private ignoreMatcher: IgnoreMatcher;
 
   private remoteManifest: { file: string; size: number; mtimeMs?: number }[] = [];
   private manifestRequestedAt = 0;
@@ -72,6 +104,7 @@ export class SyncEngine {
     this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
     const cfg = vscode.workspace.getConfiguration('linesync');
     this.maxFileSizeBytes = (cfg.get<number>('maxFileSizeKB') ?? 512) * 1024;
+    this.ignoreMatcher = this.buildIgnoreMatcher();
 
     try {
       const wsId = this.safeId(this.root);
@@ -87,6 +120,7 @@ export class SyncEngine {
     // Presence updates from local selection
     this.disposables.push(
       vscode.window.onDidChangeTextEditorSelection((e) => {
+        if (!this.myPeerId) return;
         const rel = toRel(this.root, e.textEditor.document.uri.fsPath);
         if (!rel) return;
         const sel = e.selections[0];
@@ -114,14 +148,29 @@ export class SyncEngine {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((doc) => this.trackDocument(doc)),
       vscode.workspace.onDidChangeTextDocument((e) => this.onTextChanged(e)),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('linesync.ignorePatterns')) {
+          this.ignoreMatcher = this.buildIgnoreMatcher();
+        }
+      }),
     );
 
     for (const doc of vscode.workspace.textDocuments) this.trackDocument(doc);
   }
 
   dispose() {
+    for (const s of this.snapshotSends.values()) {
+      if (s.retryTimer) clearInterval(s.retryTimer);
+    }
+    this.snapshotSends.clear();
+    this.snapshotRecv.clear();
+    this.snapshotRecvBytes = 0;
     for (const t of this.persistTimers.values()) clearTimeout(t);
     this.persistTimers.clear();
+    for (const stop of this.untrackFileListeners.values()) stop();
+    this.untrackFileListeners.clear();
+    this.trackedFiles.clear();
+    this.lastSnapshotRequestAt.clear();
     this.disposables.forEach((d) => d.dispose());
     this.disposables = [];
   }
@@ -169,7 +218,9 @@ export class SyncEngine {
         return;
       }
       if (p.type === 'y_update') {
-        this.applyRemoteYUpdate(e.from, p.file, p.updateB64);
+        const file = this.normalizeRelativePath(p.file);
+        if (!file || this.isIgnored(file)) return;
+        this.applyRemoteYUpdate(e.from, file, p.updateB64);
         return;
       }
       if (p.type === 'manifest_request') {
@@ -181,15 +232,21 @@ export class SyncEngine {
         return;
       }
       if (p.type === 'snapshot_request') {
-        if (this.isHost) this.handleSnapshotRequest(p.file);
+        const file = this.normalizeRelativePath(p.file);
+        if (!file || this.isIgnored(file)) return;
+        if (this.isHost) this.handleSnapshotRequest(file);
         return;
       }
       if (p.type === 'snapshot_chunk') {
-        this.handleSnapshotChunk(p);
+        const file = this.normalizeRelativePath(p.file);
+        if (!file || this.isIgnored(file)) return;
+        this.handleSnapshotChunk({ ...p, file });
         return;
       }
       if (p.type === 'snapshot_ack') {
-        this.handleSnapshotAck(p);
+        const file = this.normalizeRelativePath(p.file);
+        if (!file || this.isIgnored(file)) return;
+        this.handleSnapshotAck({ ...p, file });
         return;
       }
     }
@@ -203,14 +260,18 @@ export class SyncEngine {
   }
 
   private trackDocument(doc: vscode.TextDocument) {
-    const rel = toRel(this.root, doc.uri.fsPath);
+    const relRaw = toRel(this.root, doc.uri.fsPath);
+    if (!relRaw) return;
+    const rel = this.normalizeRelativePath(relRaw);
     if (!rel) return;
+    if (this.isIgnored(rel)) return;
 
     // For binary or very large docs, use snapshot transfer instead of CRDT text.
     if (!isTextDoc(doc) || isBinaryPath(rel) || Buffer.byteLength(doc.getText(), 'utf8') > this.maxFileSizeBytes) {
       this.requestSnapshot(rel);
       return;
     }
+    if (this.trackedFiles.has(rel)) return;
 
     const entry = this.store.getOrCreate(rel);
 
@@ -224,20 +285,18 @@ export class SyncEngine {
       }, 'init');
     }
 
-    // Broadcast doc updates
-    entry.doc.on('update', (update: Uint8Array, origin: any) => {
-      if (origin === 'remote') return;
-      const updateB64 = Buffer.from(update).toString('base64');
-      this.transport.send({ type: 'y_update', file: rel, updateB64 } satisfies Payload);
-    });
-
-    // Persist full state debounced (covers local + remote changes).
-    entry.doc.on('update', (_update: Uint8Array, _origin: any) => {
+    // Broadcast and persist doc updates.
+    const onDocUpdate = (update: Uint8Array, origin: any) => {
+      if (origin !== 'remote') {
+        const updateB64 = Buffer.from(update).toString('base64');
+        this.transport.send({ type: 'y_update', file: rel, updateB64 } satisfies Payload);
+      }
       this.schedulePersist(rel);
-    });
+    };
+    entry.doc.on('update', onDocUpdate);
 
     // Apply remote Y.Text deltas to editor without full replace.
-    entry.text.observe((evt: any) => {
+    const onTextObserved = (evt: any) => {
       const tr = evt?.transaction;
       if (!tr || tr.origin !== 'remote') return;
       const delta = Array.isArray(evt.delta) ? evt.delta : null;
@@ -246,14 +305,24 @@ export class SyncEngine {
         // Fallback: if delta apply fails, do a full replace to re-converge.
         this.applyDocToEditor(rel).catch(() => {});
       });
+    };
+    entry.text.observe(onTextObserved);
+
+    this.trackedFiles.add(rel);
+    this.untrackFileListeners.set(rel, () => {
+      entry.doc.off('update', onDocUpdate);
+      entry.text.unobserve(onTextObserved);
     });
   }
 
   private onTextChanged(e: vscode.TextDocumentChangeEvent) {
     const doc = e.document;
     if (!isTextDoc(doc)) return;
-    const rel = toRel(this.root, doc.uri.fsPath);
+    const relRaw = toRel(this.root, doc.uri.fsPath);
+    if (!relRaw) return;
+    const rel = this.normalizeRelativePath(relRaw);
     if (!rel) return;
+    if (this.isIgnored(rel)) return;
     if (this.applyingRemote.has(rel)) return;
     if (this.suppressEditorToDoc.has(rel)) return;
     const entry = this.store.getOrCreate(rel);
@@ -347,6 +416,7 @@ export class SyncEngine {
     this.suppressDocToEditor.add(file);
     this.suppressEditorToDoc.add(file);
     try {
+      const entry = this.store.getOrCreate(file);
       const edit = new vscode.WorkspaceEdit();
       for (const op of ops) {
         if (op.kind === 'delete') {
@@ -359,6 +429,14 @@ export class SyncEngine {
         }
       }
       await vscode.workspace.applyEdit(edit);
+
+      // Safety net: if editor text still diverges from Yjs doc (e.g. due to earlier drift),
+      // fall back to a full replace to re-converge.
+      const current = doc.getText();
+      const expected = entry.text.toString();
+      if (current !== expected) {
+        await this.applyDocToEditor(file);
+      }
     } finally {
       setTimeout(() => {
         this.suppressDocToEditor.delete(file);
@@ -372,6 +450,7 @@ export class SyncEngine {
     for (const [clientId, state] of this.docPresence.awareness.getStates()) {
       const s: any = state;
       const peerId = typeof s?.peerId === 'string' && s.peerId ? s.peerId : String(clientId);
+      if (peerId === this.myPeerId) continue;
       const nameFromRelay = this.peers.get(peerId) ?? '';
       const name = nameFromRelay || String(s?.name || '');
       const file = typeof s?.file === 'string' ? s.file : null;
@@ -407,8 +486,14 @@ export class SyncEngine {
       }));
     const pick = await vscode.window.showQuickPick(picks, { placeHolder: 'LineSync: Remote files' });
     if (!pick) return;
-    const rel = pick.f.file;
-    const uri = vscode.Uri.file(path.join(this.root, rel));
+    const rel = this.normalizeRelativePath(pick.f.file);
+    if (!rel || this.isIgnored(rel)) {
+      vscode.window.showWarningMessage('LineSync: That file is ignored by your settings.');
+      return;
+    }
+    const safe = this.safeWorkspacePath(rel);
+    if (!safe) return;
+    const uri = vscode.Uri.file(safe.abs);
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc, { preview: false });
     if (isBinaryPath(rel) || (pick.f.size ?? 0) > this.maxFileSizeBytes) {
@@ -440,6 +525,17 @@ export class SyncEngine {
     editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
   }
 
+  async resyncFile(uri: vscode.Uri): Promise<{ ok: boolean; file?: string; reason?: string }> {
+    if (uri.scheme !== 'file') return { ok: false, reason: 'Only local files can be resynced.' };
+    const relRaw = toRel(this.root, uri.fsPath);
+    if (!relRaw) return { ok: false, reason: 'File is outside the current workspace.' };
+    const rel = this.normalizeRelativePath(relRaw);
+    if (!rel) return { ok: false, reason: 'Invalid file path.' };
+    if (this.isIgnored(rel)) return { ok: false, reason: 'File is ignored by linesync.ignorePatterns.' };
+    this.requestSnapshot(rel);
+    return { ok: true, file: rel };
+  }
+
   private async sendManifest() {
     const now = Date.now();
     if (now - this.lastManifestSentAt < 1000) return;
@@ -452,8 +548,10 @@ export class SyncEngine {
       const uris = await vscode.workspace.findFiles('**/*', exclude, 5000);
       const files: { file: string; size: number; mtimeMs?: number }[] = [];
       for (const u of uris) {
-        const rel = toRel(this.root, u.fsPath);
+        const relRaw = toRel(this.root, u.fsPath);
+        const rel = relRaw ? this.normalizeRelativePath(relRaw) : null;
         if (!rel) continue;
+        if (this.isIgnored(rel)) continue;
         try {
           const st = fs.statSync(u.fsPath);
           if (!st.isFile()) continue;
@@ -516,107 +614,275 @@ export class SyncEngine {
   }
 
   private requestSnapshot(file: string) {
-    if (!file) return;
-    this.transport.send({ type: 'snapshot_request', file } satisfies Payload);
+    const rel = this.normalizeRelativePath(file);
+    if (!rel) return;
+    if (this.isIgnored(rel)) return;
+    const now = Date.now();
+    const last = this.lastSnapshotRequestAt.get(rel) ?? 0;
+    if (now - last < 1200) return;
+    this.lastSnapshotRequestAt.set(rel, now);
+    this.transport.send({ type: 'snapshot_request', file: rel } satisfies Payload);
   }
 
   private handleSnapshotRequest(file: string) {
-    if (!file) return;
-    const fsPath = path.join(this.root, file);
+    const safe = this.safeWorkspacePath(file);
+    if (!safe) return;
     let data: Buffer;
     try {
-      data = fs.readFileSync(fsPath);
+      data = fs.readFileSync(safe.abs);
     } catch {
       return;
     }
-    if (data.length > Math.max(this.maxFileSizeBytes, 8 * 1024 * 1024)) {
-      // Hard cap to avoid absurd transfers until we add dedicated UI.
-      return;
-    }
+    if (data.length > this.snapshotTransferCapBytes()) return;
+
     const id = crypto.randomUUID();
-    const chunkSize = 32 * 1024;
-    const total = Math.ceil(data.length / chunkSize) || 1;
-    for (let i = 0; i < total; i++) {
-      const slice = data.subarray(i * chunkSize, Math.min(data.length, (i + 1) * chunkSize));
-      const msg = {
-        type: 'snapshot_chunk',
-        file,
-        id,
-        chunk: i,
-        total,
-        dataB64: slice.toString('base64'),
-      };
-      this.transport.send(msg as any);
-      this.trackPendingSnapshotChunk(msg);
+    const total = Math.max(1, Math.ceil(data.length / SNAPSHOT_CHUNK_BYTES));
+    const state: SnapshotSendState = {
+      file: safe.rel,
+      id,
+      data,
+      total,
+      totalBytes: data.length,
+      sha256: crypto.createHash('sha256').update(data).digest('hex'),
+      nextChunk: 0,
+      acked: new Set<number>(),
+      inFlight: new Map<number, { sentAt: number; tries: number }>(),
+      retryTimer: null,
+    };
+    const key = this.snapshotSendKey(state.file, state.id);
+    this.snapshotSends.set(key, state);
+    state.retryTimer = setInterval(() => this.retrySnapshotTransfer(key), 400);
+    this.pumpSnapshotTransfer(key);
+  }
+
+  private snapshotTransferCapBytes(): number {
+    return Math.max(this.maxFileSizeBytes, 8 * 1024 * 1024);
+  }
+
+  private snapshotSendKey(file: string, id: string): string {
+    return `${file}|${id}`;
+  }
+
+  private snapshotRecvKey(file: string, id: string): string {
+    return `${file}|${id}`;
+  }
+
+  private finalizeSnapshotSend(key: string) {
+    const state = this.snapshotSends.get(key);
+    if (!state) return;
+    if (state.retryTimer) clearInterval(state.retryTimer);
+    this.snapshotSends.delete(key);
+  }
+
+  private pumpSnapshotTransfer(key: string) {
+    const state = this.snapshotSends.get(key);
+    if (!state) return;
+    while (state.inFlight.size < SNAPSHOT_SEND_WINDOW && state.nextChunk < state.total) {
+      this.sendSnapshotChunk(state, state.nextChunk, false);
+      state.nextChunk++;
+    }
+    if (state.acked.size >= state.total) {
+      this.finalizeSnapshotSend(key);
     }
   }
 
-  private snapshotChunkKey(msg: { file: string; id: string; chunk: number }): string {
-    return `${msg.file}|${msg.id}|${msg.chunk}`;
+  private sendSnapshotChunk(state: SnapshotSendState, chunk: number, isRetry: boolean) {
+    const start = chunk * SNAPSHOT_CHUNK_BYTES;
+    const end = Math.min(state.totalBytes, start + SNAPSHOT_CHUNK_BYTES);
+    const payload = {
+      type: 'snapshot_chunk',
+      file: state.file,
+      id: state.id,
+      chunk,
+      total: state.total,
+      totalBytes: state.totalBytes,
+      sha256: state.sha256,
+      dataB64: state.data.subarray(start, end).toString('base64'),
+    };
+    const existing = state.inFlight.get(chunk);
+    const tries = existing ? existing.tries + 1 : 1;
+    if (tries > SNAPSHOT_MAX_RETRIES) return;
+    state.inFlight.set(chunk, { sentAt: Date.now(), tries });
+    try {
+      this.transport.send(payload as Payload);
+    } catch {
+      if (!isRetry) return;
+    }
   }
 
-  private trackPendingSnapshotChunk(msg: any) {
-    if (!msg || typeof msg.file !== 'string' || typeof msg.id !== 'string' || typeof msg.chunk !== 'number') return;
-    const key = this.snapshotChunkKey(msg);
-    if (this.pendingSnapshotChunks.has(key)) return;
-    const timer = setTimeout(() => this.retryPendingSnapshotChunk(key), 2000);
-    this.pendingSnapshotChunks.set(key, { tries: 1, msg, timer });
-  }
-
-  private retryPendingSnapshotChunk(key: string) {
-    const p = this.pendingSnapshotChunks.get(key);
-    if (!p) return;
-    if (p.tries >= 5) {
-      clearTimeout(p.timer);
-      this.pendingSnapshotChunks.delete(key);
+  private retrySnapshotTransfer(key: string) {
+    const state = this.snapshotSends.get(key);
+    if (!state) return;
+    if (state.acked.size >= state.total) {
+      this.finalizeSnapshotSend(key);
       return;
     }
-    p.tries++;
-    try { this.transport.send(p.msg); } catch { /* ignore */ }
-    p.timer = setTimeout(() => this.retryPendingSnapshotChunk(key), 2000);
-    this.pendingSnapshotChunks.set(key, p);
+    const now = Date.now();
+    for (const [chunk, inflight] of state.inFlight) {
+      if (state.acked.has(chunk)) {
+        state.inFlight.delete(chunk);
+        continue;
+      }
+      if (now - inflight.sentAt < SNAPSHOT_RETRY_MS) continue;
+      if (inflight.tries >= SNAPSHOT_MAX_RETRIES) {
+        this.finalizeSnapshotSend(key);
+        return;
+      }
+      this.sendSnapshotChunk(state, chunk, true);
+    }
+    this.pumpSnapshotTransfer(key);
   }
 
   private handleSnapshotAck(p: { file: string; id: string; chunk: number }) {
-    const key = `${p.file}|${p.id}|${p.chunk}`;
-    const pending = this.pendingSnapshotChunks.get(key);
-    if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingSnapshotChunks.delete(key);
+    const key = this.snapshotSendKey(p.file, p.id);
+    const state = this.snapshotSends.get(key);
+    if (!state) return;
+    if (!Number.isInteger(p.chunk) || p.chunk < 0 || p.chunk >= state.total) return;
+    state.acked.add(p.chunk);
+    state.inFlight.delete(p.chunk);
+    if (state.acked.size >= state.total) {
+      this.finalizeSnapshotSend(key);
+      return;
+    }
+    this.pumpSnapshotTransfer(key);
+  }
+
+  private clearSnapshotRecv(key: string) {
+    const recv = this.snapshotRecv.get(key);
+    if (!recv) return;
+    this.snapshotRecv.delete(key);
+    this.snapshotRecvBytes = Math.max(0, this.snapshotRecvBytes - recv.totalBytes);
+  }
+
+  private gcSnapshotRecv() {
+    const now = Date.now();
+    for (const [key, recv] of this.snapshotRecv) {
+      if (now - recv.lastAt > SNAPSHOT_RECV_TTL_MS) {
+        this.clearSnapshotRecv(key);
+      }
     }
   }
 
-  private handleSnapshotChunk(p: { file: string; id: string; chunk: number; total: number; dataB64: string }) {
-    // Ack immediately so sender can stop retrying.
+  private handleSnapshotChunk(p: { file: string; id: string; chunk: number; total: number; totalBytes: number; sha256: string; dataB64: string }) {
+    if (!Number.isInteger(p.chunk) || !Number.isInteger(p.total) || !Number.isInteger(p.totalBytes)) return;
+    if (p.total < 1 || p.total > 1024) return;
+    if (p.chunk < 0 || p.chunk >= p.total) return;
+    if (p.totalBytes < 0 || p.totalBytes > this.snapshotTransferCapBytes()) return;
+    if (!/^[a-f0-9]{64}$/.test(String(p.sha256 || ''))) return;
+    if (p.dataB64.length > 220_000) return;
+
+    const expectedTotal = Math.max(1, Math.ceil(p.totalBytes / SNAPSHOT_CHUNK_BYTES));
+    if (expectedTotal !== p.total) return;
+    const expectedChunkSize = p.chunk === p.total - 1
+      ? p.totalBytes - SNAPSHOT_CHUNK_BYTES * (p.total - 1)
+      : SNAPSHOT_CHUNK_BYTES;
+    if (expectedChunkSize < 0 || expectedChunkSize > SNAPSHOT_CHUNK_BYTES) return;
+
+    let chunkData: Buffer;
+    try {
+      chunkData = Buffer.from(p.dataB64, 'base64');
+    } catch {
+      return;
+    }
+    if (chunkData.length !== expectedChunkSize) return;
+
+    const recvKey = this.snapshotRecvKey(p.file, p.id);
+    this.gcSnapshotRecv();
+
+    let recv = this.snapshotRecv.get(recvKey);
+    if (!recv) {
+      if (this.snapshotRecvBytes + p.totalBytes > SNAPSHOT_MAX_ACTIVE_RECV_BYTES) return;
+      recv = {
+        file: p.file,
+        id: p.id,
+        total: p.total,
+        totalBytes: p.totalBytes,
+        sha256: p.sha256,
+        received: new Map<number, Buffer>(),
+        receivedBytes: 0,
+        lastAt: Date.now(),
+      };
+      this.snapshotRecv.set(recvKey, recv);
+      this.snapshotRecvBytes += p.totalBytes;
+    }
+
+    if (recv.total !== p.total || recv.totalBytes !== p.totalBytes || recv.sha256 !== p.sha256) {
+      this.clearSnapshotRecv(recvKey);
+      return;
+    }
+    recv.lastAt = Date.now();
+
+    if (!recv.received.has(p.chunk)) {
+      recv.received.set(p.chunk, chunkData);
+      recv.receivedBytes += chunkData.length;
+    }
+
+    // Ack after accepted chunk so sender can continue windowed transfer.
     this.transport.send({ type: 'snapshot_ack', file: p.file, id: p.id, chunk: p.chunk } satisfies Payload);
 
-    let recv = this.snapshotRecv.get(p.id);
-    if (!recv) {
-      recv = { total: p.total, received: new Map() };
-      this.snapshotRecv.set(p.id, recv);
-    }
-    recv.received.set(p.chunk, p.dataB64);
     if (recv.received.size < recv.total) return;
+    if (recv.receivedBytes !== recv.totalBytes) {
+      this.clearSnapshotRecv(recvKey);
+      return;
+    }
 
-    // Reassemble
     const parts: Buffer[] = [];
     for (let i = 0; i < recv.total; i++) {
-      const b64 = recv.received.get(i);
-      if (!b64) return;
-      parts.push(Buffer.from(b64, 'base64'));
+      const part = recv.received.get(i);
+      if (!part) {
+        this.clearSnapshotRecv(recvKey);
+        return;
+      }
+      parts.push(part);
     }
-    this.snapshotRecv.delete(p.id);
-    const data = Buffer.concat(parts);
-    if (data.length > Math.max(this.maxFileSizeBytes, 8 * 1024 * 1024)) return;
 
-    const fsPath = path.join(this.root, p.file);
+    const data = Buffer.concat(parts, recv.totalBytes);
+    this.clearSnapshotRecv(recvKey);
+
+    const digest = crypto.createHash('sha256').update(data).digest('hex');
+    if (digest !== p.sha256) return;
+
+    const safe = this.safeWorkspacePath(p.file);
+    if (!safe) return;
     try {
-      fs.mkdirSync(path.dirname(fsPath), { recursive: true });
-      fs.writeFileSync(fsPath, data);
+      fs.mkdirSync(path.dirname(safe.abs), { recursive: true });
+      fs.writeFileSync(safe.abs, data);
     } catch {
       return;
     }
     vscode.window.showInformationMessage(`LineSync: Received snapshot for ${p.file}`);
   }
-}
 
+  private buildIgnoreMatcher(): IgnoreMatcher {
+    const cfg = vscode.workspace.getConfiguration('linesync');
+    const patterns = (cfg.get<string[]>('ignorePatterns') ?? []).filter(Boolean);
+    return new IgnoreMatcher(patterns);
+  }
+
+  private isIgnored(relPath: string): boolean {
+    return this.ignoreMatcher.isIgnored(relPath);
+  }
+
+  private normalizeRelativePath(input: string): string | null {
+    const raw = String(input || '').replace(/\\/g, '/').trim();
+    if (!raw) return null;
+    if (raw.includes('\0')) return null;
+    if (/^[a-zA-Z]:/.test(raw)) return null;
+    if (raw.startsWith('/')) return null;
+
+    const normalized = path.posix.normalize(raw).replace(/^(\.\/)+/, '');
+    if (!normalized || normalized === '.') return null;
+    if (normalized.startsWith('../')) return null;
+    if (normalized.includes('/../')) return null;
+    return normalized;
+  }
+
+  private safeWorkspacePath(relPath: string): { rel: string; abs: string } | null {
+    const rel = this.normalizeRelativePath(relPath);
+    if (!rel) return null;
+    const abs = path.resolve(this.root, rel);
+    const back = path.relative(path.resolve(this.root), abs);
+    if (back.startsWith('..') || path.isAbsolute(back)) return null;
+    return { rel, abs };
+  }
+}

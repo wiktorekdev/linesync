@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import WebSocket from 'ws';
 import { decryptJson, deriveRelayPasswordHash, deriveSessionKey, encryptJson } from './cryptoV2';
 import type { EncEnvelope, JoinMessage, Payload } from './protocol';
@@ -7,6 +8,7 @@ export type TransportEvent =
   | { type: 'session_info'; peerId: string; peers: { peerId: string; peerName: string }[] }
   | { type: 'peer_joined'; peerId: string; peerName: string }
   | { type: 'peer_left'; peerId: string }
+  | { type: 'rtt'; rttMs: number }
   | { type: 'enc'; from: string; payload: Payload }
   | { type: 'error'; code?: string; message?: string };
 
@@ -17,6 +19,7 @@ export class Transport {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pingPending: number | null = null;
   private missedHeartbeats = 0;
+  private lastRttMs: number | null = null;
 
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
@@ -28,29 +31,42 @@ export class Transport {
     private relayUrl: string,
     private sessionId: string,
     private myName: string,
-    private password: string,
+    private sessionSecret: string,
     private relaySecret: string,
     private clientToken: string,
     private onEvent: (e: TransportEvent) => void
   ) {
-    this.keyPromise = deriveSessionKey(password, sessionId);
+    this.keyPromise = deriveSessionKey(sessionSecret, sessionId);
   }
 
   async connect(): Promise<void> {
     this.autoReconnect = true;
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let handshakeComplete = false;
+      const safeResolve = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const safeReject = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
       try {
         this.ws = new WebSocket(this.relayUrl, {
           perMessageDeflate: { zlibDeflateOptions: { level: 6 }, threshold: 512 },
         });
       } catch (e: any) {
-        reject(new Error(`Invalid relay URL: ${e.message}`));
+        safeReject(new Error(`Invalid relay URL: ${e.message}`));
         return;
       }
 
       const timeout = setTimeout(() => {
         this.ws?.terminate();
-        reject(new Error('Connection timed out (10s)'));
+        safeReject(new Error('Connection timed out (10s)'));
       }, 10_000);
 
       this.ws.on('open', () => {
@@ -61,7 +77,7 @@ export class Transport {
           session: this.sessionId,
           peerName: this.myName,
           secret: this.relaySecret || undefined,
-          password: deriveRelayPasswordHash(this.password, this.sessionId),
+          password: deriveRelayPasswordHash(this.sessionSecret, this.sessionId),
           clientToken: this.clientToken,
         };
         this.ws!.send(JSON.stringify(join));
@@ -75,7 +91,8 @@ export class Transport {
         if (msg.type === 'session_info') {
           clearTimeout(timeout);
           this.onEvent({ type: 'session_info', peerId: String(msg.peerId || ''), peers: Array.isArray(msg.peers) ? msg.peers : [] });
-          resolve();
+          handshakeComplete = true;
+          safeResolve();
           return;
         }
         if (msg.type === 'peer_joined') {
@@ -88,6 +105,9 @@ export class Transport {
         }
         if (msg.type === 'pong') {
           if (this.pingPending !== null) {
+            const rtt = Math.max(0, Date.now() - this.pingPending);
+            this.lastRttMs = rtt;
+            this.onEvent({ type: 'rtt', rttMs: rtt });
             this.pingPending = null;
             this.missedHeartbeats = 0;
           }
@@ -119,16 +139,20 @@ export class Transport {
       this.ws.on('error', (err: Error) => {
         clearTimeout(timeout);
         this.onEvent({ type: 'error', message: err.message });
-        reject(err);
+        safeReject(err);
       });
 
       this.ws.on('close', (code: number) => {
         clearTimeout(timeout);
         this.stopPing();
+        if (!settled) {
+          safeReject(new Error(closeCodeToMessage(code)));
+        }
         if (code === 4001 || code === 4002 || code === 4003 || code === 4004) {
           this.disposed = true;
           return;
         }
+        if (!handshakeComplete) return;
         if (!this.disposed && this.autoReconnect) this.scheduleReconnect();
       });
     });
@@ -143,26 +167,16 @@ export class Transport {
     this.ws = null;
   }
 
-  stopAutoReconnect() {
-    this.autoReconnect = false;
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    vscode.window.showInformationMessage('LineSync: Auto-reconnect stopped. Use Menu -> Reconnect to try again.');
-  }
-
-  async reconnectNow() {
-    if (this.disposed) return;
-    this.autoReconnect = true;
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    this.reconnectAttempts = 0;
-    await this.connect();
-  }
-
   async send(payload: Payload) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const key = await this.keyPromise;
     const { iv, data } = await encryptJson(key, payload);
     const env: EncEnvelope = { type: 'enc', v: 1, iv, data };
     this.ws.send(JSON.stringify(env));
+  }
+
+  getLastRttMs(): number | null {
+    return this.lastRttMs;
   }
 
   private startPing() {
@@ -192,7 +206,7 @@ export class Transport {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.autoReconnect = false;
       vscode.window.showWarningMessage(
-        `LineSync: Auto-reconnect stopped after ${this.reconnectAttempts} attempts. Use Menu -> Reconnect to try again.`
+        `LineSync: Auto-reconnect stopped after ${this.reconnectAttempts} attempts. Start or join the session again from the LineSync menu.`
       );
       return;
     }
@@ -208,8 +222,37 @@ function isString(x: unknown): x is string {
   return typeof x === 'string';
 }
 
+function closeCodeToMessage(code: number): string {
+  switch (code) {
+    case 4001: return 'Unauthorized: relay secret mismatch';
+    case 4002: return 'Session is full';
+    case 4003: return 'Invalid session token';
+    case 4004: return 'Session token is required';
+    case 4007: return 'Disconnected: heartbeat timeout';
+    case 4008: return 'Too many join attempts (rate limited)';
+    case 4010: return 'You were removed from the session';
+    case 4011: return 'You are banned from this session';
+    case 1000: return 'Connection closed';
+    default: return `Connection closed (code ${code})`;
+  }
+}
+
 function isNumber(x: unknown): x is number {
   return typeof x === 'number' && Number.isFinite(x);
+}
+
+function isSafeRelativeFile(x: unknown): x is string {
+  if (!isString(x)) return false;
+  const raw = x.replace(/\\/g, '/').trim();
+  if (!raw || raw.length > 1024) return false;
+  if (raw.includes('\0')) return false;
+  if (/^[a-zA-Z]:/.test(raw)) return false;
+  if (raw.startsWith('/')) return false;
+  const normalized = path.posix.normalize(raw);
+  if (!normalized || normalized === '.') return false;
+  if (normalized.startsWith('../')) return false;
+  if (normalized.includes('/../')) return false;
+  return true;
 }
 
 function isPayload(x: unknown): x is Payload {
@@ -220,20 +263,23 @@ function isPayload(x: unknown): x is Payload {
     case 'awareness_update':
       return isString((x as any).updateB64) && (x as any).updateB64.length <= 2_000_000;
     case 'y_update':
-      return isString((x as any).file) && isString((x as any).updateB64) && (x as any).updateB64.length <= 2_000_000;
+      return isSafeRelativeFile((x as any).file) && isString((x as any).updateB64) && (x as any).updateB64.length <= 2_000_000;
     case 'snapshot_request':
-      return isString((x as any).file);
+      return isSafeRelativeFile((x as any).file);
     case 'snapshot_chunk':
       return (
-        isString((x as any).file) &&
+        isSafeRelativeFile((x as any).file) &&
         isString((x as any).id) &&
         isNumber((x as any).chunk) &&
         isNumber((x as any).total) &&
+        isNumber((x as any).totalBytes) &&
+        isString((x as any).sha256) &&
+        /^[a-f0-9]{64}$/.test((x as any).sha256) &&
         isString((x as any).dataB64) &&
         (x as any).dataB64.length <= 2_000_000
       );
     case 'snapshot_ack':
-      return isString((x as any).file) && isString((x as any).id) && isNumber((x as any).chunk);
+      return isSafeRelativeFile((x as any).file) && isString((x as any).id) && isNumber((x as any).chunk);
     case 'manifest_request':
       return true;
     case 'manifest': {
@@ -241,7 +287,7 @@ function isPayload(x: unknown): x is Payload {
       if (!Array.isArray(files) || files.length > 10_000) return false;
       for (const f of files) {
         if (!f || typeof f !== 'object') return false;
-        if (!isString((f as any).file)) return false;
+        if (!isSafeRelativeFile((f as any).file)) return false;
         if (!isNumber((f as any).size)) return false;
         if ((f as any).mtimeMs !== undefined && !isNumber((f as any).mtimeMs)) return false;
       }

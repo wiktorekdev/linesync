@@ -26,8 +26,8 @@ Built for **pair programming**, **code reviews**, and **mentoring** where live c
 - **Live sync** - edits appear on the guest's machine as you type
 - **End-to-end encrypted** - file contents are encrypted with AES-GCM; the relay never sees your code
 - **Auto-relay selection** - connects to the lowest-latency public relay automatically
-- **One-paste joining** - share a single join token and guests are in with no extra steps
-- **Password-protected sessions** - only people with the password can join
+- **One-paste joining** - share a single session token and guests are in with no extra steps
+- **Token-protected sessions** - only people with the token can join
 - **Smart file exclusions** - skips binaries, generated files, and anything you configure
 
 ---
@@ -42,7 +42,7 @@ Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and run:
 LineSync: Start New Session
 ```
 
-You'll receive a **session code** and a **password**. Share them with your collaborator - or copy the **join token** (`SESSIONCODE.PASSWORD`) for a single-paste experience.
+LineSync auto-generates a secret and copies a **session token** to your clipboard. Share that token for a single-paste join.
 
 ### 2 - Join a session (guest)
 
@@ -52,7 +52,7 @@ Open the Command Palette and run:
 LineSync: Join Session
 ```
 
-Paste the session code (or the full join token) and enter the password. You're live.
+Paste the session token. You're live.
 
 ---
 
@@ -62,7 +62,6 @@ Paste the session code (or the full join token) and enter the password. You're l
 {
   "linesync.relayUrl": "auto",
   "linesync.userName": "YourName",
-  "linesync.mergePolicy": "prompt",
   "linesync.maxFileSizeKB": 512,
   "linesync.ignorePatterns": []
 }
@@ -72,8 +71,7 @@ Paste the session code (or the full join token) and enter the password. You're l
 |---|---|---|
 | `linesync.relayUrl` | `"auto"` | Relay URL, or `"auto"` to pick the fastest one. |
 | `linesync.relayUrls` | *(built-in list)* | Override the relay candidates used during auto-selection. |
-| `linesync.userName` | `""` | Your display name shown to other session participants. |
-| `linesync.mergePolicy` | `"prompt"` | What to do when auto-merge fails: `prompt`, or others. |
+| `linesync.userName` | `""` | Your display name shown to other session participants. Empty = anonymous generated name. |
 | `linesync.relaySecret` | `""` | Shared secret for connecting to a private relay. |
 | `linesync.maxFileSizeKB` | `512` | Skip files larger than this size. |
 | `linesync.ignorePatterns` | `[]` | Extra glob patterns or folders to exclude from sync. |
@@ -96,14 +94,14 @@ Need more control? You can self-host the relay - see the [GitHub repository](htt
 
 ## Security
 
-LineSync encrypts all file data **before** it leaves your machine using **AES-GCM** with a key derived from your session password.
+LineSync encrypts all file data **before** it leaves your machine using **AES-GCM** with a key derived from your session secret.
 
 The relay routes messages between peers but cannot read your files. It can see:
 - IP addresses and connection metadata
 - Message sizes and timing
-- Session codes (not passwords or file contents)
+- Session identifiers (not file contents)
 
-For this reason, always choose a **strong session password**.
+For this reason, keep your **session token private**.
 
 For vulnerability reports, see [SECURITY.md](https://github.com/wiktorekdev/linesync/blob/main/SECURITY.md).
 
