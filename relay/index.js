@@ -14,6 +14,7 @@ const SIZE_LIMITS = {
   request_sync:      1    * 1024,
   conflict_resolve:  256  * 1024,
   enc:               1024 * 1024,
+  join:              4    * 1024,
   admin_kick:        1    * 1024,
   admin_ban:         1    * 1024,
   _default:          64   * 1024,
@@ -265,18 +266,6 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
-      // All these are forwarded as-is with sender stamp
-      case 'patch':
-      case 'cursor':
-      case 'file_state_chunk':
-      case 'file_state_done':
-      case 'file_deleted':       // scenario 6
-      case 'request_sync':
-      case 'conflict_resolve': {
-        if (!currentSession) return;
-        broadcast(currentSession, { ...msg, from: currentPeerId }, currentPeerId);
-        break;
-      }
       case 'enc': {
         if (!currentSession) return;
         if (!isValidEncEnvelope(msg)) {

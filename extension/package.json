@@ -14,13 +14,8 @@
                              "onCommand:linesync.startSession",
                              "onCommand:linesync.joinSession",
                              "onCommand:linesync.disconnect",
-                             "onCommand:linesync.copySessionCode",
                              "onCommand:linesync.showMenu",
-                             "onCommand:linesync.showBackups",
-                             "onCommand:linesync.resyncFile",
-                             "onCommand:linesync.togglePause",
-                             "onCommand:linesync.doctor",
-                             "onCommand:linesync.explainIgnore"
+                             "onCommand:linesync.openSettings"
                          ],
     "main":  "./out/extension.js",
     "contributes":  {
@@ -41,32 +36,12 @@
                                              "icon":  "$(circle-slash)"
                                          },
                                          {
-                                             "command":  "linesync.copySessionCode",
-                                             "title":  "LineSync: Copy Session Code"
-                                         },
-                                         {
                                              "command":  "linesync.showMenu",
-                                             "title":  "LineSync: Show Menu"
+                                             "title":  "LineSync: Menu"
                                          },
                                          {
-                                             "command":  "linesync.showBackups",
-                                             "title":  "LineSync: Show Backups / Restore Deleted Files"
-                                         },
-                                         {
-                                             "command":  "linesync.doctor",
-                                             "title":  "LineSync: Doctor"
-                                         },
-                                         {
-                                             "command":  "linesync.resyncFile",
-                                             "title":  "LineSync: Resync Current File"
-                                         },
-                                         {
-                                             "command":  "linesync.togglePause",
-                                             "title":  "LineSync: Pause/Resume Sync"
-                                         },
-                                         {
-                                             "command":  "linesync.explainIgnore",
-                                             "title":  "LineSync: Why Is This Ignored?"
+                                             "command":  "linesync.openSettings",
+                                             "title":  "LineSync: Settings"
                                          }
                                      ],
                         "configuration":  {
@@ -104,6 +79,32 @@
                                                                                                     "default":  5000,
                                                                                                     "description":  "How long (ms) to highlight lines changed by a peer."
                                                                                                 },
+                                                                 "linesync.peerDecorationsStyle": {
+                                                                                                   "type": "string",
+                                                                                                   "default": "git",
+                                                                                                   "enum": ["full", "git", "minimal"],
+                                                                                                   "description": "How peer decorations look. full = background highlights, git = subtle gutter/ruler, minimal = cursor/selection only."
+                                                                                                 },
+                                                                 "linesync.peerShowChangedLineLabel": {
+                                                                                                   "type": "boolean",
+                                                                                                   "default": false,
+                                                                                                   "description": "Show a '<- name' label on lines highlighted as changed by a peer."
+                                                                                                 },
+                                                                 "linesync.peerShowCursorLabel": {
+                                                                                                   "type": "boolean",
+                                                                                                   "default": true,
+                                                                                                   "description": "Show peer name next to the cursor marker."
+                                                                                                 },
+                                                                 "linesync.peerShowCursorCoords": {
+                                                                                                   "type": "boolean",
+                                                                                                   "default": true,
+                                                                                                   "description": "Show cursor coordinates (line:col) next to the peer cursor."
+                                                                                                 },
+                                                                 "linesync.peerSelectionOpacity": {
+                                                                                                   "type": "number",
+                                                                                                   "default": 0.12,
+                                                                                                   "description": "Opacity for peer selection highlight (0.0 - 0.5 recommended)."
+                                                                                                 },
                                                                  "linesync.maxFileSizeKB":  {
                                                                                                 "type":  "number",
                                                                                                 "default":  512,
@@ -207,15 +208,15 @@
                             "@types/vscode":  "^1.80.0",
                             "@types/node":  "^20.0.0",
                             "@types/ws":  "^8.5.10",
-                            "@types/diff-match-patch":  "^1.0.36",
                             "typescript":  "^5.3.0",
                             "esbuild":  "^0.25.0",
                             "@vscode/vsce":  "^2.24.0"
                         },
     "dependencies":  {
-                         "diff-match-patch":  "^1.0.5",
-                         "node-diff3":  "^3.2.0",
-                         "ws":  "^8.16.0"
+                         "ws":  "^8.16.0",
+                         "yjs": "^13.6.0",
+                         "y-protocols": "^1.0.6",
+                         "lib0": "^0.2.99"
                      },
     "license":  "MIT",
     "repository":  {

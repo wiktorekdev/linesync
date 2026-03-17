@@ -5,15 +5,19 @@ import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
 import { IgnoreMatcher } from './ignoreMatcher';
-import { SyncClient } from './syncClient';
 import { DecorationManager } from './decorationManager';
 import WebSocket from 'ws';
+import { Transport } from './transport';
+import { SyncEngine } from './syncEngine';
 
-let client: SyncClient | undefined;
+let transport: Transport | undefined;
+let engine: SyncEngine | undefined;
 let decorationManager: DecorationManager | undefined;
 let output: vscode.OutputChannel | undefined;
 let paused = false;
 let extContext: vscode.ExtensionContext | undefined;
+let currentSessionId: string | undefined;
+let currentJoinToken: string | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   decorationManager = new DecorationManager(context);
@@ -52,8 +56,10 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('linesync.disconnect', () => {
-      client?.disconnect();
-      client = undefined;
+      transport?.disconnect();
+      transport = undefined;
+      engine?.dispose();
+      engine = undefined;
       decorationManager?.clearAll();
       paused = false;
       extContext?.globalState.update('linesync.paused', false);
@@ -61,254 +67,132 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('linesync.copySessionCode', async () => {
-      if (client) {
-        await vscode.env.clipboard.writeText(client.getSessionId());
+      if (transport) {
+        await vscode.env.clipboard.writeText(currentSessionId ?? '');
         vscode.window.showInformationMessage('LineSync: Copied session code to clipboard');
       } else {
         vscode.window.showInformationMessage('LineSync: Not currently in a session');
       }
     }),
 
-    vscode.commands.registerCommand('linesync.managePeers', async () => {
-      if (!client || !client.isHostUser()) {
-        vscode.window.showErrorMessage('LineSync: Only the host can manage peers.');
+    vscode.commands.registerCommand('linesync.copySessionInvite', async () => {
+      if (!transport) {
+        vscode.window.showInformationMessage('LineSync: Not currently in a session');
         return;
       }
-      const peers = client.getPeers();
-      if (peers.length === 0) {
-        vscode.window.showInformationMessage('LineSync: No other peers in session.');
-        return;
-      }
-
-      const picks = peers.map((p) => ({
-        label: p.name,
-        description: p.peerId,
-        peerId: p.peerId,
-      }));
-      const selected = await vscode.window.showQuickPick(picks, { placeHolder: 'Select a peer' });
-      if (!selected) return;
-
-      const action = await vscode.window.showQuickPick(
-        [
-          { label: 'Kick (disconnect)', id: 'kick' },
-          { label: 'Ban (kick and block rejoin)', id: 'ban' },
-        ],
-        { placeHolder: `Action for ${selected.label}` }
+      const token = currentJoinToken ?? '';
+      const action = await vscode.window.showInformationMessage(
+        `LineSync: Invite token for ${currentSessionId ?? ''}`,
+        'Copy invite token'
       );
-      if (!action) return;
-      if (action.id === 'kick') client.kickPeer(selected.peerId);
-      if (action.id === 'ban') client.banPeer(selected.peerId);
-    }),
-
-    vscode.commands.registerCommand('linesync.doctor', async () => {
-      if (!output) return;
-      output.clear();
-      output.appendLine('LineSync Doctor');
-      output.appendLine('');
-
-      const cfg = vscode.workspace.getConfiguration('linesync');
-      const relayUrl = (cfg.get<string>('relayUrl', '') || '').trim();
-      const relayUrls = (cfg.get<string[]>('relayUrls') ?? []).map((u) => u.trim()).filter(Boolean);
-      const relaySecret = (cfg.get<string>('relaySecret', '') || '').trim();
-      const maxFileSizeKB = cfg.get<number>('maxFileSizeKB') ?? 512;
-      const ignorePatterns = cfg.get<string[]>('ignorePatterns') ?? [];
-
-      output.appendLine(`Workspace: ${vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '(none)'}`);
-      output.appendLine(`relayUrl: ${relayUrl || '(empty)'}`);
-      output.appendLine(`relayUrls: ${relayUrls.length}`);
-      output.appendLine(`relaySecret: ${relaySecret ? '(set)' : '(empty)'}`);
-      output.appendLine(`maxFileSizeKB: ${maxFileSizeKB}`);
-      output.appendLine(`ignorePatterns: ${ignorePatterns.length}`);
-      output.appendLine('');
-
-      if (!vscode.workspace.workspaceFolders?.length) {
-        output.appendLine('FAIL: No workspace folder open.');
-        output.show(true);
-        vscode.window.showErrorMessage('LineSync Doctor: Open a workspace folder first.');
-        return;
-      }
-
-      const targets = relayUrl && relayUrl !== 'auto' ? [relayUrl] : relayUrls;
-      if (targets.length === 0) {
-        output.appendLine('FAIL: No relay configured. Set linesync.relayUrl or linesync.relayUrls.');
-        output.show(true);
-        vscode.window.showErrorMessage('LineSync Doctor: No relay configured.');
-        return;
-      }
-
-      const results = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'LineSync Doctor: checking relays...', cancellable: false },
-        async () => {
-          return Promise.all(targets.map(async (u) => {
-            const httpUrl = u.replace(/^wss?:\/\//, (m) => m === 'wss://' ? 'https://' : 'http://');
-            const r: {
-              url: string;
-              health: number | null;
-              configOk: boolean;
-              requirePassword: boolean | null;
-              wsMs: number | null;
-              error?: string;
-            } = { url: u, health: null, configOk: false, requirePassword: null, wsMs: null };
-            try {
-              r.health = await httpGetStatus(`${httpUrl}/health`, 2000);
-            } catch (e) {
-              r.error = `health failed: ${e instanceof Error ? e.message : String(e)}`;
-            }
-            try {
-              const cfgData = await httpGetJson<{ requirePassword?: boolean }>(`${httpUrl}/config`, 2000);
-              r.configOk = true;
-              r.requirePassword = !!cfgData?.requirePassword;
-            } catch (e) {
-              r.error = (r.error ? r.error + '; ' : '') + `config failed: ${e instanceof Error ? e.message : String(e)}`;
-            }
-            try {
-              const ms = await probeRelay(u, 1500);
-              r.wsMs = Number.isFinite(ms) ? ms : null;
-            } catch (e) {
-              r.error = (r.error ? r.error + '; ' : '') + `ws probe failed: ${e instanceof Error ? e.message : String(e)}`;
-            }
-            return r;
-          }));
-        }
+      if (action !== 'Copy invite token') return;
+      const ok = await vscode.window.showWarningMessage(
+        'LineSync: The invite token includes the session password. Share it only with people you trust.',
+        { modal: true },
+        'Copy'
       );
+      if (ok !== 'Copy') return;
+      await vscode.env.clipboard.writeText(token);
+      vscode.window.showInformationMessage('LineSync: Copied invite token to clipboard');
+    }),
 
-      output.appendLine('Suggestions:');
-      if (relayUrl === 'auto' && relayUrls.length === 0) {
-        output.appendLine('- relayUrl is set to auto but relayUrls is empty. Add relays or set relayUrl directly.');
-      }
-      if (relayUrl && relayUrl !== 'auto' && !relayUrl.startsWith('ws://') && !relayUrl.startsWith('wss://')) {
-        output.appendLine('- relayUrl should start with ws:// or wss://');
-      }
-      output.appendLine('');
+    vscode.commands.registerCommand('linesync.openSettings', async () => {
+      vscode.commands.executeCommand('workbench.action.openSettings', 'linesync');
+    }),
 
-      let okCount = 0;
-      for (const r of results) {
-        const ok = r.configOk && (r.health === 200 || r.health === null) && r.wsMs !== null;
-        if (ok) okCount++;
-        output.appendLine(`Relay: ${r.url}`);
-        output.appendLine(`  /health: ${r.health ?? '(no response)'}`);
-        output.appendLine(`  /config: ${r.configOk ? 'ok' : 'fail'}${r.requirePassword !== null ? ` (requirePassword=${r.requirePassword})` : ''}`);
-        output.appendLine(`  ws probe: ${r.wsMs !== null ? `${r.wsMs} ms` : 'fail'}`);
-        if (r.error) output.appendLine(`  note: ${r.error}`);
-        if (r.requirePassword === true) {
-          output.appendLine('  tip: This relay requires a session password.');
-        }
-        output.appendLine('');
+    vscode.commands.registerCommand('linesync.stopReconnect', async () => {
+      if (!transport) {
+        vscode.window.showInformationMessage('LineSync: Not currently in a session');
+        return;
       }
+      transport.stopAutoReconnect();
+    }),
 
-      output.show(true);
-      if (okCount > 0) {
-        vscode.window.showInformationMessage(`LineSync Doctor: OK (${okCount}/${results.length} relays reachable). See Output -> LineSync.`);
-      } else {
-        vscode.window.showErrorMessage('LineSync Doctor: No relays reachable. See Output -> LineSync.');
+    vscode.commands.registerCommand('linesync.reconnect', async () => {
+      if (!transport) {
+        vscode.window.showInformationMessage('LineSync: Not currently in a session');
+        return;
+      }
+      try {
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'LineSync: Reconnecting...', cancellable: true },
+          async (_, token) => {
+            token.onCancellationRequested(() => transport?.stopAutoReconnect());
+            await transport!.reconnectNow();
+          }
+        );
+        vscode.window.showInformationMessage('LineSync: Reconnected');
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`LineSync: Reconnect failed - ${msg}`);
       }
     }),
 
-    vscode.commands.registerCommand('linesync.resyncFile', async (uri?: vscode.Uri) => {
-      if (!client) {
-        vscode.window.showErrorMessage('LineSync: Not connected.');
-        return;
-      }
-      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      if (!root) return;
-      const fsPath = uri?.scheme === 'file'
-        ? uri.fsPath
-        : vscode.window.activeTextEditor?.document.uri.scheme === 'file'
-          ? vscode.window.activeTextEditor.document.uri.fsPath
-          : '';
-      if (!fsPath) {
-        vscode.window.showErrorMessage('LineSync: Open a file to resync.');
-        return;
-      }
-      const rel = fsPath.startsWith(root) ? fsPath.slice(root.length).replace(/\\/g, '/').replace(/^\/+/, '') : '';
-      if (!rel) {
-        vscode.window.showErrorMessage('LineSync: File is outside the workspace.');
-        return;
-      }
-      client.resyncFile(rel);
-      vscode.window.showInformationMessage(`LineSync: Requested resync for ${rel}`);
-    }),
-
-    vscode.commands.registerCommand('linesync.togglePause', async () => {
-      if (!client) {
-        vscode.window.showErrorMessage('LineSync: Not connected.');
-        return;
-      }
-      paused = !paused;
-      client.setPaused(paused);
-      await extContext?.globalState.update('linesync.paused', paused);
-      vscode.window.showInformationMessage(`LineSync: Sync ${paused ? 'paused' : 'resumed'}.`);
-    }),
-
-    vscode.commands.registerCommand('linesync.explainIgnore', async (uri?: vscode.Uri) => {
-      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      if (!root) {
-        vscode.window.showErrorMessage('LineSync: Open a workspace folder first.');
-        return;
-      }
-
-      const fsPath = uri?.scheme === 'file'
-        ? uri.fsPath
-        : vscode.window.activeTextEditor?.document.uri.scheme === 'file'
-          ? vscode.window.activeTextEditor.document.uri.fsPath
-          : '';
-      if (!fsPath) {
-        vscode.window.showErrorMessage('LineSync: Select a file.');
-        return;
-      }
-      const rel = fsPath.startsWith(root) ? fsPath.slice(root.length).replace(/\\/g, '/').replace(/^\/+/, '') : '';
-      if (!rel) {
-        vscode.window.showErrorMessage('LineSync: File is outside the workspace.');
-        return;
-      }
-
-      const cfg = vscode.workspace.getConfiguration('linesync');
-      const rawPatterns: string[] = cfg.get('ignorePatterns') ?? [];
-      const matcher = new IgnoreMatcher(rawPatterns);
-      const reason = matcher.explain(rel);
-      if (reason) {
-        vscode.window.showInformationMessage(`LineSync: "${rel}" is ignored by pattern: ${reason}`);
-      } else {
-        vscode.window.showInformationMessage(`LineSync: "${rel}" is not ignored by ignorePatterns.`);
-      }
-    }),
+    // NOTE: Host-only peer management, change password, doctor, resync, pause, and ignore explain
+    // will return later via Menu only (presence-ui/migration steps). For now we keep v2 core small.
 
     vscode.commands.registerCommand('linesync.showMenu', async () => {
-      const isConnected = !!client;
-      const copyLabel = isConnected ? `Copy session code (${client!.getSessionId()})` : null;
+      const isConnected = !!transport;
+      const copyLabel = isConnected ? `Copy session code (${currentSessionId ?? ''})` : null;
       
       const picks: { label: string; id: string; description?: string }[] = [];
-      if (isConnected) picks.push({ label: '$(clippy) ' + copyLabel, id: 'copy' });
+      if (isConnected) {
+        picks.push({ label: '$(clippy) ' + copyLabel, id: 'copy' });
+        picks.push({ label: '$(mail) Copy session invite token', id: 'copyInvite', description: 'Includes password' });
+      }
       
       picks.push(
         { label: isConnected ? '$(stop) Disconnect' : '$(broadcast) Start new session', id: isConnected ? 'disconnect' : 'start' },
         { label: '$(plug) Join session', id: 'join' }
       );
 
-      if (isConnected && client!.isHostUser()) {
-        picks.push({ label: '$(person) Manage peers', id: 'managePeers', description: 'Kick or ban (Host only)' });
+      if (isConnected) {
+        // reconnect controls are still exposed via menu for v2 transport
+        // Transport does not expose state yet; just show both actions.
+        if (true) {
+          picks.push({ label: '$(debug-stop) Stop reconnecting', id: 'stopReconnect', description: 'Stops auto-reconnect attempts' });
+        }
+        if (true) {
+          picks.push({ label: '$(sync) Reconnect now', id: 'reconnectNow', description: 'Try connecting again' });
+        }
+        picks.push({ label: '$(file) Browse remote files', id: 'browseRemote', description: 'Request file list from host' });
+        picks.push({ label: '$(eye) Follow peer', id: 'followPeer', description: 'Jump to a peer cursor' });
+        picks.push({ label: '$(paintcan) Decorations: Full', id: 'decorFull' });
+        picks.push({ label: '$(paintcan) Decorations: Git', id: 'decorGit' });
+        picks.push({ label: '$(paintcan) Decorations: Minimal', id: 'decorMinimal' });
+        picks.push({ label: '$(symbol-keyword) Toggle cursor label', id: 'toggleCursorLabel' });
+        picks.push({ label: '$(symbol-numeric) Toggle cursor coords', id: 'toggleCursorCoords' });
       }
 
       picks.push(
-        { label: '$(gear) Open settings', id: 'settings' },
-        { label: '$(history) Show backups', id: 'backups' },
-        { label: '$(debug) Doctor', id: 'doctor', description: 'Check config and relay connectivity' },
-        { label: '$(sync) Resync current file', id: 'resync', description: 'Request latest file state from host' },
-        { label: paused ? '$(play) Resume sync' : '$(debug-pause) Pause sync', id: 'pause', description: 'Stops sending your changes (still receives)' }
+        { label: '$(gear) Settings', id: 'settings' },
       );
       
       const pick = await vscode.window.showQuickPick(picks, { placeHolder: 'LineSync' });
       if (!pick) return;
       if (pick.id === 'copy') vscode.commands.executeCommand('linesync.copySessionCode');
+      if (pick.id === 'copyInvite') vscode.commands.executeCommand('linesync.copySessionInvite');
       if (pick.id === 'disconnect') vscode.commands.executeCommand('linesync.disconnect');
       if (pick.id === 'start') vscode.commands.executeCommand('linesync.startSession');
       if (pick.id === 'join') vscode.commands.executeCommand('linesync.joinSession');
-      if (pick.id === 'managePeers') vscode.commands.executeCommand('linesync.managePeers');
-      if (pick.id === 'settings') vscode.commands.executeCommand('workbench.action.openSettings', 'linesync');
-      if (pick.id === 'backups') vscode.commands.executeCommand('linesync.showBackups');
-      if (pick.id === 'doctor') vscode.commands.executeCommand('linesync.doctor');
-      if (pick.id === 'resync') vscode.commands.executeCommand('linesync.resyncFile');
-      if (pick.id === 'pause') vscode.commands.executeCommand('linesync.togglePause');
+      if (pick.id === 'stopReconnect') vscode.commands.executeCommand('linesync.stopReconnect');
+      if (pick.id === 'reconnectNow') vscode.commands.executeCommand('linesync.reconnect');
+      if (pick.id === 'browseRemote') engine?.showRemoteFileBrowser();
+      if (pick.id === 'followPeer') engine?.followPeer();
+      if (pick.id === 'decorFull') vscode.workspace.getConfiguration('linesync').update('peerDecorationsStyle', 'full', true);
+      if (pick.id === 'decorGit') vscode.workspace.getConfiguration('linesync').update('peerDecorationsStyle', 'git', true);
+      if (pick.id === 'decorMinimal') vscode.workspace.getConfiguration('linesync').update('peerDecorationsStyle', 'minimal', true);
+      if (pick.id === 'toggleCursorLabel') {
+        const cfg = vscode.workspace.getConfiguration('linesync');
+        const v = cfg.get<boolean>('peerShowCursorLabel', true);
+        cfg.update('peerShowCursorLabel', !v, true);
+      }
+      if (pick.id === 'toggleCursorCoords') {
+        const cfg = vscode.workspace.getConfiguration('linesync');
+        const v = cfg.get<boolean>('peerShowCursorCoords', true);
+        cfg.update('peerShowCursorCoords', !v, true);
+      }
+      if (pick.id === 'settings') vscode.commands.executeCommand('linesync.openSettings');
     })
   );
 
@@ -316,7 +200,8 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  client?.disconnect();
+  transport?.disconnect();
+  engine?.dispose();
   decorationManager?.dispose();
 }
 
@@ -328,9 +213,11 @@ async function startSession(
   mode: 'host' | 'guest',
   guestPasswordFromToken?: string
 ) {
-  if (client) {
-    client.disconnect();
-    client = undefined;
+  if (transport) {
+    transport.disconnect();
+    transport = undefined;
+    engine?.dispose();
+    engine = undefined;
     decorationManager?.clearAll();
   }
 
@@ -361,15 +248,13 @@ async function startSession(
   }
   if (!userName) userName = 'Anonymous';
 
-  client = new SyncClient(
-    relayUrl,
-    sessionId,
-    userName,
-    sessionPassword,
-    decorationManager!,
-    context
-  );
-  client.setPaused(paused);
+  currentSessionId = sessionId;
+  currentJoinToken = formatJoinToken(sessionId, sessionPassword);
+
+  const clientToken = context.globalState.get<string>('linesync.clientToken') ?? '';
+  if (!clientToken) {
+    context.globalState.update('linesync.clientToken', crypto.randomUUID());
+  }
 
   try {
     await vscode.window.withProgress({
@@ -377,8 +262,19 @@ async function startSession(
       title: 'LineSync: Connecting...',
       cancellable: true
     }, async (_, token) => {
-      token.onCancellationRequested(() => client?.disconnect());
-      await client!.connect();
+      transport = new Transport(
+        relayUrl,
+        sessionId,
+        userName,
+        sessionPassword,
+        cfg.get<string>('relaySecret', '') ?? '',
+        context.globalState.get<string>('linesync.clientToken') ?? '',
+        (e) => engine?.handleTransportEvent(e)
+      );
+      engine = new SyncEngine(transport, userName, decorationManager!, context, sessionId);
+      engine.attach();
+      token.onCancellationRequested(() => transport?.disconnect());
+      await transport!.connect();
     });
     
     if (mode === 'host') {
@@ -405,7 +301,9 @@ async function startSession(
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     vscode.window.showErrorMessage(`LineSync: Failed to connect - ${msg}`);
-    client = undefined;
+    transport = undefined;
+    engine?.dispose();
+    engine = undefined;
   }
 }
 
@@ -455,7 +353,8 @@ async function resolveRelayUrlForHost(cfg: vscode.WorkspaceConfiguration): Promi
       }
     );
   }
-  return relayUrl || relayUrls[0];
+  const chosen = relayUrl || relayUrls[0];
+  return validateRelayUrl(chosen);
 }
 
 async function resolveRelayUrlForJoin(cfg: vscode.WorkspaceConfiguration, sessionId: string): Promise<string | undefined> {
@@ -463,7 +362,7 @@ async function resolveRelayUrlForJoin(cfg: vscode.WorkspaceConfiguration, sessio
   const relayUrls = (cfg.get<string[]>('relayUrls') ?? []).map((u) => u.trim()).filter(Boolean);
 
   if (relayUrl && relayUrl !== 'auto') {
-    return relayUrl;
+    return validateRelayUrl(relayUrl);
   }
   if (relayUrls.length === 0) return relayUrl;
   
@@ -481,11 +380,29 @@ async function resolveRelayUrlForJoin(cfg: vscode.WorkspaceConfiguration, sessio
         return null;
       }));
       const found = results.find(x => x !== null);
-      if (found) return found;
+      if (found) return validateRelayUrl(found) ?? undefined;
       vscode.window.showErrorMessage(`LineSync: Could not find session ${sessionId} on any configured relay.`);
       return undefined;
     }
   );
+}
+
+function validateRelayUrl(url: string | undefined): string | undefined {
+  const u = (url ?? '').trim();
+  if (!u) return undefined;
+  if (!u.startsWith('ws://') && !u.startsWith('wss://')) {
+    vscode.window.showErrorMessage('LineSync: relayUrl must start with ws:// or wss://');
+    return undefined;
+  }
+  if (u.startsWith('ws://')) {
+    const host = u.slice('ws://'.length).split('/')[0].split(':')[0].toLowerCase();
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    if (!isLocal) {
+      vscode.window.showErrorMessage('LineSync: For security, ws:// is only allowed for localhost. Use wss:// for remote relays.');
+      return undefined;
+    }
+  }
+  return u;
 }
 
 function probeRelay(url: string, timeoutMs: number): Promise<number> {

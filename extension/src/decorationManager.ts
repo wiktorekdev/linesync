@@ -10,11 +10,39 @@ const PALETTE = [
   { bg: 'rgba(220,220,170,0.14)', ruler: '#dcdcaa', cursor: '#dcdcaa', label: 'rgba(220,220,170,0.8)' },
 ];
 
+type PeerDecorationsStyle = 'full' | 'git' | 'minimal';
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
+}
+
+function rgbaFromBase(base: string, alpha: number): string {
+  // base is 'rgba(r,g,b,a)' - replace a with alpha
+  const m = base.match(/^rgba\((\d+),(\d+),(\d+),([0-9.]+)\)$/);
+  if (!m) return base;
+  const a = clamp01(alpha);
+  return `rgba(${m[1]},${m[2]},${m[3]},${a})`;
+}
+
+function getDecorConfig() {
+  const cfg = vscode.workspace.getConfiguration('linesync');
+  const style = (cfg.get<string>('peerDecorationsStyle') ?? 'git') as PeerDecorationsStyle;
+  const showChangedLabel = cfg.get<boolean>('peerShowChangedLineLabel') ?? false;
+  const showCursorLabel = cfg.get<boolean>('peerShowCursorLabel') ?? true;
+  const showCursorCoords = cfg.get<boolean>('peerShowCursorCoords') ?? true;
+  const selOpacityRaw = cfg.get<number>('peerSelectionOpacity') ?? 0.12;
+  const selectionOpacity = clamp01(selOpacityRaw);
+  return { style, showChangedLabel, showCursorLabel, showCursorCoords, selectionOpacity };
+}
+
 interface PeerState {
   name: string;
   colorIdx: number;
   lineType: vscode.TextEditorDecorationType;
-  cursorType: vscode.TextEditorDecorationType;
+  cursorInlineType: vscode.TextEditorDecorationType;
+  cursorLineType: vscode.TextEditorDecorationType;
+  cursorLabelType: vscode.TextEditorDecorationType;
   selectionType: vscode.TextEditorDecorationType;
   // relativePath -> changed line numbers
   changedLines: Map<string, number[]>;
@@ -30,12 +58,24 @@ export class DecorationManager {
   private nextColor = 0;
   private workspaceRoot: string;
   private disposables: vscode.Disposable[] = [];
+  private decorCfg = getDecorConfig();
 
   constructor(private context: vscode.ExtensionContext) {
     this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
     this.disposables.push(
       vscode.window.onDidChangeActiveTextEditor(() => this.refreshAll()),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('linesync.peerDecorationsStyle')
+          || e.affectsConfiguration('linesync.peerShowChangedLineLabel')
+          || e.affectsConfiguration('linesync.peerShowCursorLabel')
+          || e.affectsConfiguration('linesync.peerShowCursorCoords')
+          || e.affectsConfiguration('linesync.peerSelectionOpacity')) {
+          this.decorCfg = getDecorConfig();
+          for (const peer of this.peers.values()) this.rebuildPeerTypes(peer);
+          this.refreshAll();
+        }
+      }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
         this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
       })
@@ -98,12 +138,16 @@ export class DecorationManager {
     // Remove decorations from all editors before disposing types
     for (const editor of vscode.window.visibleTextEditors) {
       editor.setDecorations(peer.lineType, []);
-      editor.setDecorations(peer.cursorType, []);
+      editor.setDecorations(peer.cursorInlineType, []);
+      editor.setDecorations(peer.cursorLineType, []);
+      editor.setDecorations(peer.cursorLabelType, []);
       editor.setDecorations(peer.selectionType, []);
     }
 
     peer.lineType.dispose();
-    peer.cursorType.dispose();
+    peer.cursorInlineType.dispose();
+    peer.cursorLineType.dispose();
+    peer.cursorLabelType.dispose();
     peer.selectionType.dispose();
     peer.clearTimer.forEach((t) => clearTimeout(t));
     this.peers.delete(peerId);
@@ -123,45 +167,27 @@ export class DecorationManager {
   // Internals
   private getOrCreate(peerId: string, peerName: string): PeerState {
     const existing = this.peers.get(peerId);
-    if (existing) return existing;
+    if (existing) {
+      const nextName = (peerName || '').trim();
+      if (nextName && nextName !== existing.name) {
+        existing.name = nextName;
+        this.rebuildPeerTypes(existing);
+      }
+      return existing;
+    }
 
     const colorIdx = this.nextColor % PALETTE.length;
     this.nextColor++;
     const c = PALETTE[colorIdx];
 
-    const lineType = vscode.window.createTextEditorDecorationType({
-      isWholeLine: true,
-      backgroundColor: c.bg,
-      overviewRulerColor: c.ruler,
-      overviewRulerLane: vscode.OverviewRulerLane.Right,
-      after: {
-        contentText: `  <- ${peerName}`,
-        color: c.label,
-        fontStyle: 'italic',
-        fontWeight: '400',
-      },
-    });
-
-    // Remote cursor - thin left border on that line
-    const cursorType = vscode.window.createTextEditorDecorationType({
-      borderColor: c.cursor,
-      borderStyle: 'solid',
-      borderWidth: '0 0 0 2px',
-      overviewRulerColor: c.ruler,
-      overviewRulerLane: vscode.OverviewRulerLane.Left,
-    });
-
-    const selectionType = vscode.window.createTextEditorDecorationType({
-      backgroundColor: c.bg,
-      borderRadius: '1px',
-    });
-
     const peer: PeerState = {
-      name: peerName,
+      name: (peerName || '').trim() || 'Peer',
       colorIdx,
-      lineType,
-      cursorType,
-      selectionType,
+      lineType: vscode.window.createTextEditorDecorationType({}),
+      cursorInlineType: vscode.window.createTextEditorDecorationType({}),
+      cursorLineType: vscode.window.createTextEditorDecorationType({}),
+      cursorLabelType: vscode.window.createTextEditorDecorationType({}),
+      selectionType: vscode.window.createTextEditorDecorationType({}),
       changedLines: new Map(),
       clearTimer: new Map(),
       cursorFile: null,
@@ -169,8 +195,89 @@ export class DecorationManager {
       cursorCharacter: 0,
       selection: null,
     };
+    this.rebuildPeerTypes(peer);
     this.peers.set(peerId, peer);
     return peer;
+  }
+
+  private rebuildPeerTypes(peer: PeerState) {
+    const c = PALETTE[peer.colorIdx % PALETTE.length];
+    const cfg = this.decorCfg;
+
+    peer.lineType.dispose();
+    peer.cursorInlineType.dispose();
+    peer.cursorLineType.dispose();
+    peer.cursorLabelType.dispose();
+    peer.selectionType.dispose();
+
+    // Changed lines highlight
+    if (cfg.style === 'minimal') {
+      peer.lineType = vscode.window.createTextEditorDecorationType({});
+    } else if (cfg.style === 'git') {
+      peer.lineType = vscode.window.createTextEditorDecorationType({
+        isWholeLine: true,
+        borderColor: c.cursor,
+        borderStyle: 'solid',
+        borderWidth: '0 0 0 2px',
+        overviewRulerColor: c.ruler,
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+      });
+    } else {
+      // full
+      peer.lineType = vscode.window.createTextEditorDecorationType({
+        isWholeLine: true,
+        backgroundColor: c.bg,
+        overviewRulerColor: c.ruler,
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+        after: cfg.showChangedLabel
+          ? {
+              contentText: `  <- ${peer.name}`,
+              color: c.label,
+              fontStyle: 'italic',
+              fontWeight: '400',
+            }
+          : undefined,
+      });
+    }
+
+    // Cursor: inline marker at the exact character.
+    peer.cursorInlineType = vscode.window.createTextEditorDecorationType({
+      before: {
+        contentText: '|',
+        color: c.cursor,
+        margin: '0 1px 0 0',
+      },
+      overviewRulerColor: c.ruler,
+      overviewRulerLane: vscode.OverviewRulerLane.Left,
+      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+    });
+
+    // Cursor fallback for empty lines: whole-line marker at line start
+    peer.cursorLineType = vscode.window.createTextEditorDecorationType({
+      isWholeLine: true,
+      before: {
+        contentText: '|',
+        color: c.cursor,
+        margin: '0 2px 0 0',
+      },
+      overviewRulerColor: c.ruler,
+      overviewRulerLane: vscode.OverviewRulerLane.Left,
+    });
+
+    peer.cursorLabelType = vscode.window.createTextEditorDecorationType({
+      overviewRulerColor: c.ruler,
+      overviewRulerLane: vscode.OverviewRulerLane.Left,
+      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+    });
+
+    const selectionBg = rgbaFromBase(c.bg, cfg.selectionOpacity);
+    peer.selectionType = vscode.window.createTextEditorDecorationType({
+      backgroundColor: selectionBg,
+      borderColor: cfg.style === 'minimal' ? undefined : c.cursor,
+      borderStyle: cfg.style === 'minimal' ? undefined : 'solid',
+      borderWidth: cfg.style === 'minimal' ? undefined : '1px',
+      borderRadius: '1px',
+    });
   }
 
   private applyForPeer(peer: PeerState) {
@@ -188,15 +295,42 @@ export class DecorationManager {
       );
 
       // Remote cursor indicator
-      const cursorRanges: vscode.Range[] = [];
+      const cursorInlineRanges: vscode.Range[] = [];
+      const cursorLineRanges: vscode.Range[] = [];
+      const cursorLabelRanges: vscode.DecorationOptions[] = [];
       if (peer.cursorFile === rel && peer.cursorLine >= 0 && lineCount > 0) {
         const l = Math.min(peer.cursorLine, lineCount - 1);
         const lineLen = editor.document.lineAt(l).text.length;
         const ch = Math.max(0, Math.min(peer.cursorCharacter, lineLen));
-        const endCh = lineLen > 0 ? Math.min(ch + 1, lineLen) : ch;
-        cursorRanges.push(new vscode.Range(l, ch, l, endCh));
+
+        // Label/coords next to cursor, optional.
+        const cfg = this.decorCfg;
+        const parts: string[] = [];
+        if (cfg.showCursorLabel) parts.push(peer.name || 'Peer');
+        if (cfg.showCursorCoords) parts.push(`${l + 1}:${ch + 1}`);
+        if (parts.length > 0) {
+          const label = parts.join(' ');
+          cursorLabelRanges.push({
+            range: new vscode.Range(l, ch, l, ch),
+            renderOptions: {
+              after: {
+                contentText: ` | ${label}`,
+                color: PALETTE[peer.colorIdx % PALETTE.length].label,
+                margin: '0 0 0 4px',
+              },
+            },
+          });
+        }
+
+        if (lineLen === 0) {
+          cursorLineRanges.push(new vscode.Range(l, 0, l, 0));
+        } else {
+          cursorInlineRanges.push(new vscode.Range(l, ch, l, ch));
+        }
       }
-      editor.setDecorations(peer.cursorType, cursorRanges);
+      editor.setDecorations(peer.cursorInlineType, cursorInlineRanges);
+      editor.setDecorations(peer.cursorLineType, cursorLineRanges);
+      editor.setDecorations(peer.cursorLabelType, cursorLabelRanges.length ? cursorLabelRanges : []);
 
       // Remote selection highlight
       const selectionRanges: vscode.Range[] = [];
