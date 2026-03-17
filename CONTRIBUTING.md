@@ -1,6 +1,6 @@
 # Contributing to LineSync
 
-Thanks for taking the time to contribute. This document covers how to set up your development environment, run the project locally, and submit changes.
+Thanks for contributing.
 
 ---
 
@@ -12,8 +12,6 @@ Thanks for taking the time to contribute. This document covers how to set up you
 ---
 
 ## Setup
-
-Clone the repository:
 
 ```bash
 git clone https://github.com/wiktorekdev/linesync
@@ -39,31 +37,31 @@ npm run package
 
 ---
 
-## Running the Extension Locally
+## Run Extension Locally
 
-1. Open the repo root in VS Code.
+1. Open repository root in VS Code.
 2. Go to **Run and Debug** (`Ctrl+Shift+D` / `Cmd+Shift+D`).
-3. Select and run **"LineSync: Run Extension"**.
-4. A second VS Code window will open with the extension loaded in development mode.
+3. Run **LineSync: Run Extension**.
+4. A second VS Code window opens with extension development host.
 
-> **Tip:** Launch two extension windows side-by-side to test a full host/guest session locally without needing a second machine.
+Tip: run two extension windows side by side for host/peer flow testing.
 
 ---
 
-## Submitting a Pull Request
+## Pull Requests
 
-- Keep changes focused. One concern per PR.
-- Update documentation if your change affects user-visible behavior.
-- Add tests for non-trivial logic, especially anything touching the protocol or merge behavior.
+- Keep scope focused.
+- Update docs for user-visible behavior changes.
+- Add tests for non-trivial protocol/reliability changes.
 
-### PR description template
+### PR template
 
-```
+```md
 ## Summary
 What changed and why.
 
 ## Test plan
-How you tested it — commands run, manual steps, edge cases checked.
+Commands run, manual steps, edge cases checked.
 
 ## Notes (optional)
 Risks, follow-ups, screenshots.
@@ -73,5 +71,6 @@ Risks, follow-ups, screenshots.
 
 ## Code Style
 
-- **TypeScript:** strict mode enabled; use explicit types in all public APIs.
-- **Relay:** keep dependencies minimal — the relay is designed to be lightweight and easy to self-host.
+- TypeScript strict mode is required.
+- Keep relay dependencies minimal.
+- Validate all external input.

@@ -1,230 +1,273 @@
 {
-    "name":  "linesync",
-    "displayName":  "LineSync",
-    "description":  "Premium live collaboration for code - instant peer sync without branches or commits",
-    "version":  "0.1.0",
-    "publisher":  "wiktorekdev",
-    "engines":  {
-                    "vscode":  "^1.80.0"
-                },
-    "categories":  [
-                       "Other"
-                   ],
-    "activationEvents":  [
-                             "onCommand:linesync.startSession",
-                             "onCommand:linesync.joinSession",
-                             "onCommand:linesync.disconnect",
-                             "onCommand:linesync.copySessionInvite",
-                             "onCommand:linesync.showMenu",
-                             "onCommand:linesync.openSettings",
-                             "onCommand:linesync.followPeer",
-                             "onCommand:linesync.resyncFile",
-                             "onCommand:linesync.explainIgnore"
-                         ],
-    "main":  "./out/extension.js",
-    "contributes":  {
-        "commands":  [
-                                         {
-                                             "command":  "linesync.startSession",
-                                             "title":  "LineSync: Start Session",
-                                             "icon":  "$(broadcast)"
-                                         },
-                                         {
-                                             "command":  "linesync.joinSession",
-                                             "title":  "LineSync: Join Session",
-                                             "icon":  "$(plug)"
-                                         },
-                                         {
-                                             "command":  "linesync.disconnect",
-                                             "title":  "LineSync: Disconnect",
-                                             "icon":  "$(circle-slash)"
-                                         },
-                                         {
-                                             "command":  "linesync.copySessionInvite",
-                                             "title":  "LineSync: Copy Session Token",
-                                             "icon":  "$(mail)"
-                                         },
-                                         {
-                                             "command":  "linesync.showMenu",
-                                             "title":  "LineSync: Open Menu"
-                                         },
-                                        {
-                                            "command":  "linesync.openSettings",
-                                            "title":  "LineSync: Open Settings"
-                                        },
-                                        {
-                                            "command": "linesync.followPeer",
-                                            "title": "LineSync: Follow Peer",
-                                            "icon": "$(eye)"
-                                        },
-                                        {
-                                            "command": "linesync.resyncFile",
-                                            "title": "LineSync: Resync Current File",
-                                            "icon": "$(sync)"
-                                        },
-                                        {
-                                            "command": "linesync.explainIgnore",
-                                            "title": "LineSync: Explain Ignore",
-                                            "icon": "$(question)"
-                                        }
-                                    ],
-        "configuration":  {
-                                              "title":  "LineSync",
-                                              "properties":  {
-                                                                 "linesync.relayUrl":  {
-                                                                                           "type":  "string",
-                                                                                           "default":  "",
-                                                                                           "markdownDescription":  "Relay WebSocket URL, e.g. `wss://my-relay.onrender.com`. Set `auto` to pick the lowest-latency entry from `linesync.relayUrls`."
-                                                                                       },
-                                                                 "linesync.relayUrls":  {
-                                                                                            "type":  "array",
-                                                                                            "items":  {
-                                                                                                          "type":  "string"
-                                                                                                      },
-                                                                                            "default":  [
-                                                                                                            "wss://linesync-us.onrender.com",
-                                                                                                            "wss://linesync-de.onrender.com",
-                                                                                                            "wss://linesync-sg.onrender.com"
-                                                                                                        ],
-                                                                                            "markdownDescription":  "Relay candidates used when `linesync.relayUrl` is set to `auto`."
-                                                                                        },
-                                                                 "linesync.relaySecret":  {
-                                                                                              "type":  "string",
-                                                                                              "default":  "",
-                                                                                              "markdownDescription":  "Optional relay access secret. Must match the relay `RELAY_SECRET` value."
-                                                                                          },
-                                                                 "linesync.userName":  {
-                                                                                           "type":  "string",
-                                                                                           "default":  "",
-                                                                                           "description":  "Display name shown to peers. Leave empty to use an anonymous generated alias."
-                                                                                       },
-                                                                 "linesync.peerDecorationsStyle": {
-                                                                                                   "type": "string",
-                                                                                                   "default": "git",
-                                                                                                   "enum": ["full", "git", "minimal"],
-                                                                                                   "description": "Peer decoration style. full = full-line, git = subtle gutter/ruler, minimal = cursor/selection only."
-                                                                                                 },
-                                                                 "linesync.peerShowChangedLineLabel": {
-                                                                                                   "type": "boolean",
-                                                                                                   "default": false,
-                                                                                                   "description": "Show peer name on changed-line highlights."
-                                                                                                 },
-                                                                 "linesync.peerShowCursorLabel": {
-                                                                                                   "type": "boolean",
-                                                                                                   "default": true,
-                                                                                                   "description": "Show peer name next to cursor marker."
-                                                                                                 },
-                                                                 "linesync.peerShowCursorCoords": {
-                                                                                                   "type": "boolean",
-                                                                                                   "default": true,
-                                                                                                   "description": "Show cursor coordinates (line:col) next to peer cursor."
-                                                                                                 },
-                                                                 "linesync.peerSelectionOpacity": {
-                                                                                                   "type": "number",
-                                                                                                   "default": 0.12,
-                                                                                                   "description": "Peer-selection highlight opacity (0.0 - 0.5 recommended)."
-                                                                                                 },
-                                                                 "linesync.maxFileSizeKB":  {
-                                                                                                "type":  "number",
-                                                                                                "default":  512,
-                                                                                                "markdownDescription":  "Soft live-sync limit in KB. Larger files use snapshot flow instead of continuous text sync."
-                                                                                            },
-                                                                 "linesync.ignorePatterns":  {
-                                                                                                 "type":  "array",
-                                                                                                 "items":  {
-                                                                                                               "type":  "string"
-                                                                                                           },
-                                                                                                "default":  [
-                                                                                                                "node_modules/",
-                                                                                                                ".git/",
-                                                                                                                "dist/",
-                                                                                                                "build/",
-                                                                                                                ".vscode/",
-                                                                                                                "__pycache__/",
-                                                                                                                ".next/",
-                                                                                                                ".nuxt/",
-                                                                                                                "*.lock",
-                                                                                                                "*.log",
-                                                                                                                "*.env",
-                                                                                                                "*.exe",
-                                                                                                                "*.zip",
-                                                                                                                "*.tar",
-                                                                                                                "*.gz",
-                                                                                                                "*.7z",
-                                                                                                                "*.rar",
-                                                                                                                "*.png",
-                                                                                                                "*.jpg",
-                                                                                                                "*.jpeg",
-                                                                                                                "*.gif",
-                                                                                                                "*.webp",
-                                                                                                                "*.bmp",
-                                                                                                                "*.pdf",
-                                                                                                                "*.mp3",
-                                                                                                                "*.mp4",
-                                                                                                                "*.mov",
-                                                                                                                "*.avi",
-                                                                                                                "*.mkv",
-                                                                                                                "*.wasm",
-                                                                                                                "*.dll",
-                                                                                                                "*.so",
-                                                                                                                "*.dylib",
-                                                                                                                "*.woff",
-                                                                                                                "*.woff2",
-                                                                                                                "*.ttf",
-                                                                                                                "*.otf"
-                                                                                                            ],
-                                                                                                 "description":  "Folder/file patterns excluded from sync and snapshot requests."
-                                                                                          }
-                                                             }
-                                          },
-        "menus":  {
-                                      "editor/title": [
-                                        {
-                                          "command": "linesync.followPeer",
-                                          "group": "navigation",
-                                          "when": "linesync.active"
-                                        }
-                                      ],
-                                      "explorer/context": [
-                                        {
-                                          "command": "linesync.resyncFile",
-                                          "group": "navigation",
-                                          "when": "linesync.active && resourceScheme == file"
-                                        },
-                                        {
-                                          "command": "linesync.explainIgnore",
-                                          "group": "navigation",
-                                          "when": "resourceScheme == file"
-                                        }
-                                      ]
-                                  }
-                    },
-    "scripts":  {
-                    "vscode:prepublish":  "npm run typecheck \u0026\u0026 npm run bundle",
-                    "typecheck":  "tsc -p ./ --noEmit",
-                    "bundle":  "node build.mjs",
-                    "compile":  "npm run bundle",
-                    "watch":  "tsc -watch -p ./",
-                    "package":  "vsce package --no-dependencies"
-                },
-    "devDependencies":  {
-                            "@types/vscode":  "^1.80.0",
-                            "@types/node":  "^20.0.0",
-                            "@types/ws":  "^8.5.10",
-                            "typescript":  "^5.3.0",
-                            "esbuild":  "^0.25.0",
-                            "@vscode/vsce":  "^2.24.0"
-                        },
-    "dependencies":  {
-                         "ws":  "^8.16.0",
-                         "yjs": "^13.6.0",
-                         "y-protocols": "^1.0.6",
-                         "lib0": "^0.2.99"
-                     },
-    "license":  "MIT",
-    "repository":  {
-                       "url":  "https://github.com/wiktorekdev/linesync.git",
-                       "directory":  "extension",
-                       "type":  "git"
-                   }
+  "name": "linesync",
+  "displayName": "LineSync",
+  "description": "Premium live collaboration for code - instant peer sync without branches or commits",
+  "version": "0.1.0",
+  "publisher": "wiktorekdev",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:linesync.startSession",
+    "onCommand:linesync.joinSession",
+    "onCommand:linesync.disconnect",
+    "onCommand:linesync.copySessionInvite",
+    "onCommand:linesync.showMenu",
+    "onCommand:linesync.openSettings",
+    "onCommand:linesync.followPeer",
+    "onCommand:linesync.resyncFile",
+    "onCommand:linesync.explainIgnore"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "linesync.startSession",
+        "title": "LineSync: Start Session",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "linesync.joinSession",
+        "title": "LineSync: Join Session",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "linesync.disconnect",
+        "title": "LineSync: Disconnect",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "linesync.copySessionInvite",
+        "title": "LineSync: Copy Session Token",
+        "icon": "$(mail)"
+      },
+      {
+        "command": "linesync.showMenu",
+        "title": "LineSync: Open Menu"
+      },
+      {
+        "command": "linesync.openSettings",
+        "title": "LineSync: Open Settings"
+      },
+      {
+        "command": "linesync.followPeer",
+        "title": "LineSync: Follow Peer",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "linesync.resyncFile",
+        "title": "LineSync: Resync Current File",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "linesync.explainIgnore",
+        "title": "LineSync: Explain Ignore",
+        "icon": "$(question)"
+      }
+    ],
+    "configuration": {
+      "title": "LineSync",
+      "properties": {
+        "linesync.relayUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Relay WebSocket URL, e.g. `wss://my-relay.onrender.com`. Set `auto` to pick the lowest-latency entry from `linesync.relayUrls`."
+        },
+        "linesync.relayUrls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "wss://linesync-us.onrender.com",
+            "wss://linesync-de.onrender.com",
+            "wss://linesync-sg.onrender.com"
+          ],
+          "markdownDescription": "Relay candidates used when `linesync.relayUrl` is set to `auto`."
+        },
+        "linesync.relayProbeTimeoutMs": {
+          "type": "number",
+          "default": 1200,
+          "markdownDescription": "Relay probe timeout in milliseconds used by auto-selection v2."
+        },
+        "linesync.relayProbeSamples": {
+          "type": "number",
+          "default": 3,
+          "markdownDescription": "Number of latency samples per relay for auto-selection v2."
+        },
+        "linesync.relaySecret": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional relay access secret. Must match the relay `RELAY_SECRET` value."
+        },
+        "linesync.userName": {
+          "type": "string",
+          "default": "",
+          "description": "Display name shown to peers. Leave empty to use an anonymous generated alias."
+        },
+        "linesync.peerMode": {
+          "type": "string",
+          "default": "edit",
+          "enum": [
+            "edit",
+            "readOnly"
+          ],
+          "markdownDescription": "Behavior for joined peers. `edit` allows peer edits to sync. `readOnly` keeps joined peers view-only and rolls back local edits."
+        },
+        "linesync.peerDecorationsStyle": {
+          "type": "string",
+          "default": "git",
+          "enum": [
+            "full",
+            "git",
+            "minimal"
+          ],
+          "description": "Peer decoration style. full = full-line, git = subtle gutter/ruler, minimal = cursor/selection only."
+        },
+        "linesync.peerShowChangedLineLabel": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show peer name on changed-line highlights."
+        },
+        "linesync.peerShowCursorLabel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show peer name next to cursor marker."
+        },
+        "linesync.peerShowCursorCoords": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show cursor coordinates (line:col) next to peer cursor."
+        },
+        "linesync.peerSelectionOpacity": {
+          "type": "number",
+          "default": 0.12,
+          "description": "Peer selection highlight opacity (0.0 - 0.5 recommended)."
+        },
+        "linesync.maxFileSizeKB": {
+          "type": "number",
+          "default": 512,
+          "markdownDescription": "Soft live-sync limit in KB. Larger files use snapshot flow instead of continuous text sync."
+        },
+        "linesync.autoResyncOnDrift": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically request a safe file snapshot when drift is detected (peer only)."
+        },
+        "linesync.driftCheckIntervalMs": {
+          "type": "number",
+          "default": 2500,
+          "description": "How often LineSync checks tracked files for local/session drift."
+        },
+        "linesync.autoResyncCooldownMs": {
+          "type": "number",
+          "default": 15000,
+          "description": "Minimum delay between automatic drift resync requests for the same file."
+        },
+        "linesync.maxAutoResyncPerFile": {
+          "type": "number",
+          "default": 3,
+          "description": "Maximum automatic drift resync attempts per file before requiring manual action."
+        },
+        "linesync.ignorePatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "node_modules/",
+            ".git/",
+            "dist/",
+            "build/",
+            ".vscode/",
+            "__pycache__/",
+            ".next/",
+            ".nuxt/",
+            "*.lock",
+            "*.log",
+            "*.env",
+            "*.exe",
+            "*.zip",
+            "*.tar",
+            "*.gz",
+            "*.7z",
+            "*.rar",
+            "*.png",
+            "*.jpg",
+            "*.jpeg",
+            "*.gif",
+            "*.webp",
+            "*.bmp",
+            "*.pdf",
+            "*.mp3",
+            "*.mp4",
+            "*.mov",
+            "*.avi",
+            "*.mkv",
+            "*.wasm",
+            "*.dll",
+            "*.so",
+            "*.dylib",
+            "*.woff",
+            "*.woff2",
+            "*.ttf",
+            "*.otf"
+          ],
+          "description": "Folder/file patterns excluded from sync and snapshot requests."
+        }
+      }
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "linesync.followPeer",
+          "group": "navigation",
+          "when": "linesync.active"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "linesync.resyncFile",
+          "group": "navigation",
+          "when": "linesync.active && resourceScheme == file"
+        },
+        {
+          "command": "linesync.explainIgnore",
+          "group": "navigation",
+          "when": "resourceScheme == file"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run typecheck && npm run bundle",
+    "typecheck": "tsc -p ./ --noEmit",
+    "bundle": "node build.mjs",
+    "compile": "npm run bundle",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.0",
+    "esbuild": "^0.25.0",
+    "@vscode/vsce": "^2.24.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "yjs": "^13.6.0",
+    "y-protocols": "^1.0.6",
+    "lib0": "^0.2.99"
+  },
+  "license": "MIT",
+  "repository": {
+    "url": "https://github.com/wiktorekdev/linesync.git",
+    "directory": "extension",
+    "type": "git"
+  }
 }

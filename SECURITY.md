@@ -2,30 +2,30 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in LineSync, **please do not open a public GitHub issue.**
+If you discover a security issue in LineSync, do not open a public GitHub issue.
 
-Instead, contact the maintainer directly with:
+Contact the maintainer directly and include:
 
-- A description of the vulnerability
-- Steps to reproduce it
-- The potential impact, if known
+- Description of the issue
+- Reproduction steps
+- Potential impact
 
-We will acknowledge receipt as quickly as possible and work on a fix. Once a patch is ready and deployed, the issue may be disclosed publicly.
+We will acknowledge receipt quickly, work on a patch, and coordinate disclosure timing.
 
 ---
 
 ## Scope
 
-Areas most relevant to security reports:
+Most relevant areas:
 
-- **Session encryption** — AES-GCM key derivation, IV/nonce handling, verifier logic
-- **Relay authentication** — session access control, password verifier design
-- **Extension trust** — how the extension handles data from the relay or peers
+- Session encryption (AES-GCM key derivation, IV/nonce handling, verifier logic)
+- Relay authentication and access control
+- Extension trust boundary with relay/peer data
 
 ---
 
 ## Out of Scope
 
-- Weak passwords chosen by users (the protocol cannot protect against this)
-- Relay metadata visibility (IP, timing, sizes) — this is a known and documented limitation
-- Issues in third-party dependencies not directly related to LineSync's security model
+- Leaked session tokens shared by users
+- Relay metadata visibility (IP/timing/size), which is a documented limitation
+- Vulnerabilities in third-party dependencies not specific to LineSync logic

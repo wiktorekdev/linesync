@@ -74,6 +74,11 @@ export class SyncEngine {
   private suppressDocToEditor = new Set<string>();
   private suppressEditorToDoc = new Set<string>();
   private maxFileSizeBytes: number;
+  private peerMode: 'edit' | 'readOnly' = 'edit';
+  private autoResyncOnDrift = true;
+  private driftCheckIntervalMs = 2500;
+  private autoResyncCooldownMs = 15_000;
+  private maxAutoResyncPerFile = 3;
 
   private snapshotSends = new Map<string, SnapshotSendState>();
   private snapshotRecv = new Map<string, SnapshotRecvState>(); // file|id -> recv
@@ -91,6 +96,14 @@ export class SyncEngine {
 
   private persistDir: string | null = null;
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private driftSweepTimer: ReturnType<typeof setInterval> | null = null;
+  private driftCheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private driftMismatchCount = new Map<string, number>();
+  private lastAutoResyncAt = new Map<string, number>();
+  private autoResyncCount = new Map<string, number>();
+  private lastConflictHintAt = new Map<string, number>();
+  private conflictHintInFlight = new Set<string>();
+  private readOnlyHintAt = 0;
 
   private disposables: vscode.Disposable[] = [];
 
@@ -99,11 +112,12 @@ export class SyncEngine {
     private myName: string,
     private decorationManager: DecorationManager,
     private context: vscode.ExtensionContext,
-    private sessionId: string
+    private sessionId: string,
+    private sessionMode: 'host' | 'guest'
   ) {
     this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-    const cfg = vscode.workspace.getConfiguration('linesync');
-    this.maxFileSizeBytes = (cfg.get<number>('maxFileSizeKB') ?? 512) * 1024;
+    this.maxFileSizeBytes = 512 * 1024;
+    this.loadRuntimeConfig();
     this.ignoreMatcher = this.buildIgnoreMatcher();
 
     try {
@@ -147,15 +161,28 @@ export class SyncEngine {
     // Track local doc edits -> update yjs -> broadcast
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((doc) => this.trackDocument(doc)),
+      vscode.workspace.onDidCloseTextDocument((doc) => this.untrackDocumentIfClosed(doc)),
       vscode.workspace.onDidChangeTextDocument((e) => this.onTextChanged(e)),
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration('linesync.ignorePatterns')) {
+        if (
+          e.affectsConfiguration('linesync.ignorePatterns')
+          || e.affectsConfiguration('linesync.maxFileSizeKB')
+          || e.affectsConfiguration('linesync.peerMode')
+          || e.affectsConfiguration('linesync.autoResyncOnDrift')
+          || e.affectsConfiguration('linesync.driftCheckIntervalMs')
+          || e.affectsConfiguration('linesync.autoResyncCooldownMs')
+          || e.affectsConfiguration('linesync.maxAutoResyncPerFile')
+        ) {
           this.ignoreMatcher = this.buildIgnoreMatcher();
+          const prevInterval = this.driftCheckIntervalMs;
+          this.loadRuntimeConfig();
+          if (prevInterval !== this.driftCheckIntervalMs) this.startDriftSweep();
         }
       }),
     );
 
     for (const doc of vscode.workspace.textDocuments) this.trackDocument(doc);
+    this.startDriftSweep();
   }
 
   dispose() {
@@ -165,6 +192,17 @@ export class SyncEngine {
     this.snapshotSends.clear();
     this.snapshotRecv.clear();
     this.snapshotRecvBytes = 0;
+    if (this.driftSweepTimer) {
+      clearInterval(this.driftSweepTimer);
+      this.driftSweepTimer = null;
+    }
+    for (const timer of this.driftCheckTimers.values()) clearTimeout(timer);
+    this.driftCheckTimers.clear();
+    this.driftMismatchCount.clear();
+    this.lastAutoResyncAt.clear();
+    this.autoResyncCount.clear();
+    this.lastConflictHintAt.clear();
+    this.conflictHintInFlight.clear();
     for (const t of this.persistTimers.values()) clearTimeout(t);
     this.persistTimers.clear();
     for (const stop of this.untrackFileListeners.values()) stop();
@@ -312,7 +350,29 @@ export class SyncEngine {
     this.untrackFileListeners.set(rel, () => {
       entry.doc.off('update', onDocUpdate);
       entry.text.unobserve(onTextObserved);
+      this.clearDriftTracking(rel);
     });
+    this.scheduleDriftCheck(rel, 300);
+  }
+
+  private untrackDocumentIfClosed(doc: vscode.TextDocument) {
+    if (doc.uri.scheme !== 'file') return;
+    const relRaw = toRel(this.root, doc.uri.fsPath);
+    if (!relRaw) return;
+    const rel = this.normalizeRelativePath(relRaw);
+    if (!rel) return;
+
+    // Keep listeners only while at least one editor keeps the doc open.
+    const stillOpen = vscode.workspace.textDocuments.some(
+      (d) => d !== doc && d.uri.scheme === 'file' && d.uri.fsPath === doc.uri.fsPath
+    );
+    if (stillOpen) return;
+
+    const stop = this.untrackFileListeners.get(rel);
+    if (stop) stop();
+    this.untrackFileListeners.delete(rel);
+    this.trackedFiles.delete(rel);
+    this.clearDriftTracking(rel);
   }
 
   private onTextChanged(e: vscode.TextDocumentChangeEvent) {
@@ -325,6 +385,10 @@ export class SyncEngine {
     if (this.isIgnored(rel)) return;
     if (this.applyingRemote.has(rel)) return;
     if (this.suppressEditorToDoc.has(rel)) return;
+    if (this.isPeerReadOnly()) {
+      this.rejectPeerEdit(rel);
+      return;
+    }
     const entry = this.store.getOrCreate(rel);
 
     // Apply delta edits from VS Code to Y.Text.
@@ -337,6 +401,34 @@ export class SyncEngine {
         if (c.text) entry.text.insert(c.rangeOffset, c.text);
       }
     }, 'local');
+    this.scheduleDriftCheck(rel, 220);
+  }
+
+  private isPeerReadOnly(): boolean {
+    return this.sessionMode === 'guest' && this.peerMode === 'readOnly';
+  }
+
+  private rejectPeerEdit(file: string) {
+    if (this.store.has(file)) {
+      this.applyDocToEditor(file).catch(() => {});
+    } else {
+      this.requestSnapshot(file);
+    }
+    this.scheduleDriftCheck(file, 180);
+    this.showReadOnlyPeerHint(file).catch(() => {});
+  }
+
+  private async showReadOnlyPeerHint(file: string) {
+    const now = Date.now();
+    if (now - this.readOnlyHintAt < 7000) return;
+    this.readOnlyHintAt = now;
+    const action = await vscode.window.showWarningMessage(
+      `LineSync: Peer mode is read-only. Local edits in ${file} were blocked.`,
+      'Open Settings'
+    );
+    if (action === 'Open Settings') {
+      await vscode.commands.executeCommand('workbench.action.openSettings', 'linesync.peerMode');
+    }
   }
 
   private applyRemoteYUpdate(fromPeerId: string, file: string, updateB64: string) {
@@ -348,6 +440,7 @@ export class SyncEngine {
     } finally {
       this.applyingRemote.delete(file);
     }
+    this.scheduleDriftCheck(file, 180);
     // Optional: highlight changed lines later (presence-ui todo)
   }
 
@@ -366,6 +459,7 @@ export class SyncEngine {
       edit.replace(doc.uri, new vscode.Range(0, 0, last, doc.lineAt(last).range.end.character), content);
       this.suppressEditorToDoc.add(file);
       await vscode.workspace.applyEdit(edit);
+      this.scheduleDriftCheck(file, 250);
     } finally {
       setTimeout(() => {
         this.suppressDocToEditor.delete(file);
@@ -437,6 +531,7 @@ export class SyncEngine {
       if (current !== expected) {
         await this.applyDocToEditor(file);
       }
+      this.scheduleDriftCheck(file, 250);
     } finally {
       setTimeout(() => {
         this.suppressDocToEditor.delete(file);
@@ -628,10 +723,16 @@ export class SyncEngine {
     const safe = this.safeWorkspacePath(file);
     if (!safe) return;
     let data: Buffer;
-    try {
-      data = fs.readFileSync(safe.abs);
-    } catch {
-      return;
+    const hasCrdtState = this.store.has(file);
+    if (hasCrdtState && !isBinaryPath(file)) {
+      const entry = this.store.getOrCreate(file);
+      data = Buffer.from(entry.text.toString(), 'utf8');
+    } else {
+      try {
+        data = fs.readFileSync(safe.abs);
+      } catch {
+        return;
+      }
     }
     if (data.length > this.snapshotTransferCapBytes()) return;
 
@@ -850,7 +951,125 @@ export class SyncEngine {
     } catch {
       return;
     }
+    this.scheduleDriftCheck(p.file, 250);
     vscode.window.showInformationMessage(`LineSync: Received snapshot for ${p.file}`);
+  }
+
+  private loadRuntimeConfig() {
+    const cfg = vscode.workspace.getConfiguration('linesync');
+    this.maxFileSizeBytes = this.clampInt((cfg.get<number>('maxFileSizeKB') ?? 512) * 1024, 64 * 1024, 16 * 1024 * 1024);
+    const peerMode = cfg.get<string>('peerMode')
+      ?? cfg.get<string>('guestMode', 'edit');
+    this.peerMode = peerMode === 'readOnly' ? 'readOnly' : 'edit';
+    this.autoResyncOnDrift = cfg.get<boolean>('autoResyncOnDrift', true) ?? true;
+    this.driftCheckIntervalMs = this.clampInt(cfg.get<number>('driftCheckIntervalMs', 2500) ?? 2500, 1000, 20_000);
+    this.autoResyncCooldownMs = this.clampInt(cfg.get<number>('autoResyncCooldownMs', 15000) ?? 15000, 2000, 120_000);
+    this.maxAutoResyncPerFile = this.clampInt(cfg.get<number>('maxAutoResyncPerFile', 3) ?? 3, 1, 20);
+  }
+
+  private startDriftSweep() {
+    if (this.driftSweepTimer) clearInterval(this.driftSweepTimer);
+    this.driftSweepTimer = setInterval(() => this.runDriftSweep(), this.driftCheckIntervalMs);
+  }
+
+  private runDriftSweep() {
+    for (const file of this.trackedFiles) {
+      this.scheduleDriftCheck(file, 120);
+    }
+  }
+
+  private scheduleDriftCheck(file: string, delayMs: number) {
+    const prev = this.driftCheckTimers.get(file);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.driftCheckTimers.delete(file);
+      this.checkFileDrift(file).catch(() => {});
+    }, Math.max(0, delayMs));
+    this.driftCheckTimers.set(file, timer);
+  }
+
+  private clearDriftTracking(file: string) {
+    const timer = this.driftCheckTimers.get(file);
+    if (timer) clearTimeout(timer);
+    this.driftCheckTimers.delete(file);
+    this.driftMismatchCount.delete(file);
+    this.lastAutoResyncAt.delete(file);
+    this.autoResyncCount.delete(file);
+    this.lastConflictHintAt.delete(file);
+    this.conflictHintInFlight.delete(file);
+  }
+
+  private async checkFileDrift(file: string) {
+    if (!this.store.has(file)) return;
+    const fsPath = path.join(this.root, file);
+    const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && d.uri.fsPath === fsPath);
+    if (!doc) return;
+
+    const entry = this.store.getOrCreate(file);
+    const expected = entry.text.toString();
+    const actual = doc.getText();
+
+    if (expected === actual) {
+      this.driftMismatchCount.set(file, 0);
+      this.autoResyncCount.set(file, 0);
+      return;
+    }
+
+    const mismatchCount = (this.driftMismatchCount.get(file) ?? 0) + 1;
+    this.driftMismatchCount.set(file, mismatchCount);
+    if (mismatchCount < 2) return;
+
+    if (this.isHost) {
+      if (!doc.isDirty) {
+        await this.applyDocToEditor(file);
+      }
+      await this.showConflictHint(file, doc, false);
+      return;
+    }
+
+    const now = Date.now();
+    const autoCount = this.autoResyncCount.get(file) ?? 0;
+    const lastAuto = this.lastAutoResyncAt.get(file) ?? 0;
+    const canAuto = this.autoResyncOnDrift
+      && !doc.isDirty
+      && autoCount < this.maxAutoResyncPerFile
+      && now - lastAuto >= this.autoResyncCooldownMs;
+
+    if (canAuto) {
+      this.lastAutoResyncAt.set(file, now);
+      this.autoResyncCount.set(file, autoCount + 1);
+      this.requestSnapshot(file);
+    }
+
+    await this.showConflictHint(file, doc, canAuto);
+  }
+
+  private async showConflictHint(file: string, doc: vscode.TextDocument, autoResyncTriggered: boolean) {
+    const now = Date.now();
+    const lastHint = this.lastConflictHintAt.get(file) ?? 0;
+    if (now - lastHint < 15_000) return;
+    if (this.conflictHintInFlight.has(file)) return;
+
+    this.lastConflictHintAt.set(file, now);
+    this.conflictHintInFlight.add(file);
+    try {
+      const message = doc.isDirty
+        ? `LineSync: Potential conflict in ${file}. Unsaved local edits detected.`
+        : autoResyncTriggered
+          ? `LineSync: Drift detected in ${file}. Auto-resync requested.`
+          : `LineSync: Drift detected in ${file}.`;
+      const action = await vscode.window.showWarningMessage(message, 'Resync now', 'Keep local');
+      if (action === 'Resync now') {
+        this.requestSnapshot(file);
+      }
+    } finally {
+      this.conflictHintInFlight.delete(file);
+    }
+  }
+
+  private clampInt(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return min;
+    return Math.max(min, Math.min(max, Math.round(value)));
   }
 
   private buildIgnoreMatcher(): IgnoreMatcher {

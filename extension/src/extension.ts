@@ -26,6 +26,25 @@ let lastRttMs: number | null = null;
 let currentRelayUrl: string | undefined;
 let currentMode: 'host' | 'guest' | undefined;
 
+const RELAY_HEALTH_KEY = 'linesync.relayHealthV2';
+const LAST_GOOD_RELAY_KEY = 'linesync.lastGoodRelay';
+
+type RelayHealthRecord = {
+  ewmaMs: number;
+  failStreak: number;
+  lastSeen: number;
+  lastScore: number;
+};
+
+type RelayProbeSummary = {
+  url: string;
+  successCount: number;
+  failCount: number;
+  medianMs: number;
+  p90Ms: number;
+  score: number;
+};
+
 export function activate(context: vscode.ExtensionContext) {
   decorationManager = new DecorationManager(context);
   output = vscode.window.createOutputChannel('LineSync');
@@ -215,12 +234,12 @@ function setActiveUi(active: boolean) {
     : relay.includes('linesync-sg') ? 'APAC'
     : relay.startsWith('wss://') || relay.startsWith('ws://') ? 'Custom'
     : '';
-  const mode = currentMode ?? '';
+  const roleLabel = currentMode === 'guest' ? 'peer' : (currentMode ?? '');
   const regionText = relayRegion ? ` ${relayRegion}` : '';
   statusBar.text = `$(radio-tower) LineSync${regionText}  ${peersText}${rttText}`.trim();
   statusBar.tooltip = [
     `LineSync: Connected${relayRegion ? ` (${relayRegion})` : ''}`,
-    mode ? `Role: ${mode}` : null,
+    roleLabel ? `Role: ${roleLabel}` : null,
     `Peers: ${peerCount}`,
     lastRttMs !== null ? `RTT: ${Math.round(lastRttMs)} ms` : null,
     '',
@@ -258,7 +277,7 @@ async function startSession(
   let sessionToken = '';
 
   if (mode === 'host') {
-    relayUrl = await resolveRelayUrlForHost(cfg);
+    relayUrl = await resolveRelayUrlForHost(context, cfg);
     if (!relayUrl) return;
     try {
       const issued = await issueSessionToken(relayUrl, relaySecret, 3500);
@@ -276,7 +295,7 @@ async function startSession(
       vscode.window.showErrorMessage('LineSync: Invalid session token.');
       return;
     }
-    const relayCandidates = collectRelayCandidatesForJoin(cfg);
+    const relayCandidates = collectRelayCandidatesForJoin(context, cfg);
     if (relayCandidates.length === 0) {
       vscode.window.showErrorMessage('LineSync: No valid relay URLs configured.');
       return;
@@ -352,12 +371,13 @@ async function startSession(
           engine?.handleTransportEvent(e);
         }
       );
-      engine = new SyncEngine(transport, userName, decorationManager!, context, sessionId);
+      engine = new SyncEngine(transport, userName, decorationManager!, context, sessionId, mode);
       engine.attach();
       token.onCancellationRequested(() => transport?.disconnect());
       await transport!.connect();
     });
 
+    await context.globalState.update(LAST_GOOD_RELAY_KEY, relayUrl);
     setActiveUi(true);
     
     if (mode === 'host') {
@@ -430,17 +450,26 @@ async function checkConfig(): Promise<boolean> {
   return true;
 }
 
-async function resolveRelayUrlForHost(cfg: vscode.WorkspaceConfiguration): Promise<string | undefined> {
+async function resolveRelayUrlForHost(
+  context: vscode.ExtensionContext,
+  cfg: vscode.WorkspaceConfiguration
+): Promise<string | undefined> {
   let relayUrl = (cfg.get<string>('relayUrl', '') || '').trim();
   const relayUrls = (cfg.get<string[]>('relayUrls') ?? []).map((u) => u.trim()).filter(Boolean);
 
   if (relayUrl === 'auto' && relayUrls.length > 0) {
+    const probeTimeoutMs = clampInt(cfg.get<number>('relayProbeTimeoutMs', 1200) ?? 1200, 400, 5000);
+    const probeSamples = clampInt(cfg.get<number>('relayProbeSamples', 3) ?? 3, 1, 6);
     relayUrl = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'LineSync: selecting relay', cancellable: false },
+      { location: vscode.ProgressLocation.Notification, title: 'LineSync: selecting best relay', cancellable: false },
       async () => {
-        const probes = await Promise.all(relayUrls.map((u) => probeRelay(u, 1200)));
-        const best = probes.map((ms, i) => ({ url: relayUrls[i], ms })).sort((a, b) => a.ms - b.ms)[0];
-        return best && Number.isFinite(best.ms) ? best.url : relayUrls[0];
+        const validated = relayUrls
+          .map((u) => validateRelayUrl(u))
+          .filter((u): u is string => !!u);
+        if (validated.length === 0) return relayUrls[0];
+
+        const ranked = await rankRelaysV2(context, validated, probeTimeoutMs, probeSamples);
+        return ranked[0]?.url ?? validated[0];
       }
     );
   }
@@ -448,10 +477,12 @@ async function resolveRelayUrlForHost(cfg: vscode.WorkspaceConfiguration): Promi
   return validateRelayUrl(chosen);
 }
 
-function collectRelayCandidatesForJoin(cfg: vscode.WorkspaceConfiguration): string[] {
+function collectRelayCandidatesForJoin(context: vscode.ExtensionContext, cfg: vscode.WorkspaceConfiguration): string[] {
   const primary = (cfg.get<string>('relayUrl', '') || '').trim();
   const list = (cfg.get<string[]>('relayUrls') ?? []).map((u) => u.trim()).filter(Boolean);
   const out: string[] = [];
+  const health = readRelayHealth(context);
+  const lastGood = (context.globalState.get<string>(LAST_GOOD_RELAY_KEY) ?? '').trim();
 
   if (primary && primary !== 'auto') {
     const validated = validateRelayUrl(primary);
@@ -462,6 +493,16 @@ function collectRelayCandidatesForJoin(cfg: vscode.WorkspaceConfiguration): stri
     if (!validated) continue;
     if (!out.includes(validated)) out.push(validated);
   }
+
+  out.sort((a, b) => {
+    if (a === lastGood) return -1;
+    if (b === lastGood) return 1;
+    const ah = health[a];
+    const bh = health[b];
+    const as = ah ? ah.ewmaMs + ah.failStreak * 200 : Number.POSITIVE_INFINITY;
+    const bs = bh ? bh.ewmaMs + bh.failStreak * 200 : Number.POSITIVE_INFINITY;
+    return as - bs;
+  });
   return out;
 }
 
@@ -521,6 +562,84 @@ function probeRelay(url: string, timeoutMs: number): Promise<number> {
     ws.on('error', () => { clearTimeout(timer); finish(Number.POSITIVE_INFINITY); });
     ws.on('close', () => { clearTimeout(timer); finish(Number.POSITIVE_INFINITY); });
   });
+}
+
+async function rankRelaysV2(
+  context: vscode.ExtensionContext,
+  relayUrls: string[],
+  timeoutMs: number,
+  samples: number
+): Promise<RelayProbeSummary[]> {
+  const health = readRelayHealth(context);
+  const results = await Promise.all(relayUrls.map((url) => probeRelaySummary(url, timeoutMs, samples, health[url])));
+  const ranked = results.slice().sort((a, b) => a.score - b.score);
+  await writeRelayHealth(context, ranked);
+  return ranked;
+}
+
+async function probeRelaySummary(
+  url: string,
+  timeoutMs: number,
+  samples: number,
+  historical?: RelayHealthRecord
+): Promise<RelayProbeSummary> {
+  const latencies: number[] = [];
+  for (let i = 0; i < samples; i++) {
+    latencies.push(await probeRelay(url, timeoutMs));
+  }
+
+  const success = latencies.filter(Number.isFinite).sort((a, b) => a - b);
+  const failCount = latencies.length - success.length;
+  const medianMs = success.length ? percentile(success, 0.5) : timeoutMs * 2;
+  const p90Ms = success.length ? percentile(success, 0.9) : timeoutMs * 2;
+  const base = medianMs + Math.max(0, p90Ms - medianMs) * 0.6 + failCount * timeoutMs * 1.25;
+  const historicalScore = historical ? historical.ewmaMs + historical.failStreak * 160 : base;
+  const score = base * 0.7 + historicalScore * 0.3;
+
+  return {
+    url,
+    successCount: success.length,
+    failCount,
+    medianMs,
+    p90Ms,
+    score,
+  };
+}
+
+function percentile(values: number[], p: number): number {
+  if (!values.length) return Number.POSITIVE_INFINITY;
+  const idx = Math.max(0, Math.min(values.length - 1, Math.floor((values.length - 1) * p)));
+  return values[idx];
+}
+
+function readRelayHealth(context: vscode.ExtensionContext): Record<string, RelayHealthRecord> {
+  const raw = context.globalState.get<Record<string, RelayHealthRecord> | null>(RELAY_HEALTH_KEY, null);
+  if (!raw || typeof raw !== 'object') return {};
+  return raw;
+}
+
+async function writeRelayHealth(context: vscode.ExtensionContext, ranked: RelayProbeSummary[]) {
+  const now = Date.now();
+  const next = readRelayHealth(context);
+  for (const item of ranked) {
+    const prev = next[item.url];
+    const ewmaMs = prev ? prev.ewmaMs * 0.65 + item.medianMs * 0.35 : item.medianMs;
+    const failStreak = item.successCount === 0
+      ? Math.min((prev?.failStreak ?? 0) + 1, 30)
+      : Math.max(0, (prev?.failStreak ?? 0) - 1);
+    next[item.url] = {
+      ewmaMs,
+      failStreak,
+      lastSeen: now,
+      lastScore: item.score,
+    };
+  }
+  await context.globalState.update(RELAY_HEALTH_KEY, next);
+}
+
+function clampInt(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.round(n)));
 }
 
 async function getOrCreateAnonymousName(context: vscode.ExtensionContext): Promise<string> {

@@ -1,37 +1,36 @@
 # Releasing LineSync
 
-This document is for maintainers only.
+Maintainer-only guide.
 
 ---
 
-## Publishing a Release
+## Publish a Release
 
-LineSync uses GitHub Actions to build and publish releases automatically. To trigger a release, push a version tag:
+LineSync release pipeline is triggered by version tags:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The CI pipeline will build the extension and attach the `.vsix` file to a new GitHub Release.
+CI builds extension and attaches `.vsix` to GitHub Release.
 
 ---
 
-## Version Naming
+## Versioning
 
-Follow [Semantic Versioning](https://semver.org/):
+Use [Semantic Versioning](https://semver.org/):
 
-- `v0.x.0` — pre-stable releases while the protocol or API may still change
-- `v1.0.0` — first stable release
-- Patch releases (`v1.0.1`) for bug fixes; minor releases (`v1.1.0`) for new features
+- `v0.x.0` for pre-stable protocol/API iterations
+- `v1.0.0` for first stable release
+- Patch (`v1.0.1`) for fixes
+- Minor (`v1.1.0`) for features
 
 ---
 
 ## Pre-release Checklist
 
-Before pushing a tag:
-
-- [ ] `CHANGELOG` (if maintained) is up to date
-- [ ] Version in `extension/package.json` matches the tag
+- [ ] `extension/package.json` version matches tag
 - [ ] CI is green on `main`
-- [ ] Manual smoke test: start a session, join from a second window, verify sync works
+- [ ] Manual smoke test: host starts session, peer joins with token, sync works
+- [ ] Release notes updated (if maintained)

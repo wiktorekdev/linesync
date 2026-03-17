@@ -1,6 +1,6 @@
 <div align="center">
   <h1>LineSync</h1>
-  <p><strong>Real-time file sync between VS Code instances.<br/>No commits. No branches. No ceremony.</strong></p>
+  <p><strong>Premium live collaboration for VS Code.<br/>Instant peer sync without branches or commits.</strong></p>
 
   [![CI](https://img.shields.io/github/actions/workflow/status/wiktorekdev/linesync/ci.yml?branch=main&label=ci&style=flat-square&logo=githubactions&logoColor=white)](https://github.com/wiktorekdev/linesync/actions)
   ![License](https://img.shields.io/github/license/wiktorekdev/linesync?style=flat-square&color=blue)
@@ -11,48 +11,38 @@
 
 ---
 
-LineSync is a lightweight collaboration tool for developers who need to share code *right now* - without touching git. Start a session in seconds and let your teammates see every keystroke as it happens.
-
-Built for **pair programming**, **code reviews**, and **mentoring** where live context beats async patches.
-
----
-
-## How it works
-
----
-
 ## Features
 
-- **Live sync** - edits appear on the guest's machine as you type
-- **End-to-end encrypted** - file contents are encrypted with AES-GCM; the relay never sees your code
-- **Auto-relay selection** - connects to the lowest-latency public relay automatically
-- **One-paste joining** - share a single session token and guests are in with no extra steps
-- **Token-protected sessions** - only people with the token can join
-- **Smart file exclusions** - skips binaries, generated files, and anything you configure
+- Live sync of code changes as peers type
+- End-to-end encrypted payloads (AES-GCM)
+- Relay auto-selection v2 (multi-sample latency + health memory)
+- One-token join flow
+- Drift detection, conflict hints, safe auto-resync
+- Smart file exclusions and snapshot fallback for larger files
 
 ---
 
 ## Getting Started
 
-### 1 - Start a session (host)
+### Host
 
-Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and run:
+Run from Command Palette:
 
 ```
-LineSync: Start New Session
+LineSync: Start Session
 ```
 
-LineSync auto-generates a secret and copies a **session token** to your clipboard. Share that token for a single-paste join.
+LineSync generates and copies a **session token**.
 
-### 2 - Join a session (guest)
+### Peer
 
-Open the Command Palette and run:
+Run:
 
 ```
 LineSync: Join Session
 ```
 
-Paste the session token. You're live.
+Paste the session token.
 
 ---
 
@@ -61,26 +51,28 @@ Paste the session token. You're live.
 ```json
 {
   "linesync.relayUrl": "auto",
+  "linesync.relayUrls": [
+    "wss://linesync-us.onrender.com",
+    "wss://linesync-de.onrender.com",
+    "wss://linesync-sg.onrender.com"
+  ],
+  "linesync.relayProbeTimeoutMs": 1200,
+  "linesync.relayProbeSamples": 3,
   "linesync.userName": "YourName",
+  "linesync.peerMode": "edit",
+  "linesync.relaySecret": "",
   "linesync.maxFileSizeKB": 512,
+  "linesync.autoResyncOnDrift": true,
+  "linesync.driftCheckIntervalMs": 2500,
+  "linesync.autoResyncCooldownMs": 15000,
+  "linesync.maxAutoResyncPerFile": 3,
   "linesync.ignorePatterns": []
 }
 ```
 
-| Setting | Default | Description |
-|---|---|---|
-| `linesync.relayUrl` | `"auto"` | Relay URL, or `"auto"` to pick the fastest one. |
-| `linesync.relayUrls` | *(built-in list)* | Override the relay candidates used during auto-selection. |
-| `linesync.userName` | `""` | Your display name shown to other session participants. Empty = anonymous generated name. |
-| `linesync.relaySecret` | `""` | Shared secret for connecting to a private relay. |
-| `linesync.maxFileSizeKB` | `512` | Skip files larger than this size. |
-| `linesync.ignorePatterns` | `[]` | Extra glob patterns or folders to exclude from sync. |
-
 ---
 
-## Public Relays
-
-LineSync ships with three public relays. The extension pings all of them on startup and connects to whichever is fastest.
+## Official Relays
 
 | Region | URL |
 |---|---|
@@ -88,22 +80,15 @@ LineSync ships with three public relays. The extension pings all of them on star
 | Frankfurt | `wss://linesync-de.onrender.com` |
 | Singapore | `wss://linesync-sg.onrender.com` |
 
-Need more control? You can self-host the relay - see the [GitHub repository](https://github.com/wiktorekdev/linesync) for instructions.
-
 ---
 
 ## Security
 
-LineSync encrypts all file data **before** it leaves your machine using **AES-GCM** with a key derived from your session secret.
+LineSync encrypts file payloads before sending them to relay.
 
-The relay routes messages between peers but cannot read your files. It can see:
-- IP addresses and connection metadata
-- Message sizes and timing
-- Session identifiers (not file contents)
+Relay can observe metadata (IP, timing, message sizes, session identifiers), but cannot read encrypted file contents.
 
-For this reason, keep your **session token private**.
-
-For vulnerability reports, see [SECURITY.md](https://github.com/wiktorekdev/linesync/blob/main/SECURITY.md).
+For vulnerability reporting, see [SECURITY.md](https://github.com/wiktorekdev/linesync/blob/main/SECURITY.md).
 
 ---
 
@@ -124,4 +109,4 @@ For vulnerability reports, see [SECURITY.md](https://github.com/wiktorekdev/line
 
 ## License
 
-MIT - see [LICENSE](https://github.com/wiktorekdev/linesync/blob/main/LICENSE) for details.
+MIT - see [LICENSE](https://github.com/wiktorekdev/linesync/blob/main/LICENSE).
