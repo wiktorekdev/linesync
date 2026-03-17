@@ -1,0 +1,226 @@
+{
+    "name":  "linesync",
+    "displayName":  "LineSync",
+    "description":  "Live file sync between peers - no commits, no branches, instant collaboration",
+    "version":  "0.1.0",
+    "publisher":  "wiktorekdev",
+    "engines":  {
+                    "vscode":  "^1.80.0"
+                },
+    "categories":  [
+                       "Other"
+                   ],
+    "activationEvents":  [
+                             "onCommand:linesync.startSession",
+                             "onCommand:linesync.joinSession",
+                             "onCommand:linesync.disconnect",
+                             "onCommand:linesync.copySessionCode",
+                             "onCommand:linesync.showMenu",
+                             "onCommand:linesync.showBackups",
+                             "onCommand:linesync.resyncFile",
+                             "onCommand:linesync.togglePause",
+                             "onCommand:linesync.doctor",
+                             "onCommand:linesync.explainIgnore"
+                         ],
+    "main":  "./out/extension.js",
+    "contributes":  {
+                        "commands":  [
+                                         {
+                                             "command":  "linesync.startSession",
+                                             "title":  "LineSync: Start New Session",
+                                             "icon":  "$(broadcast)"
+                                         },
+                                         {
+                                             "command":  "linesync.joinSession",
+                                             "title":  "LineSync: Join Session",
+                                             "icon":  "$(plug)"
+                                         },
+                                         {
+                                             "command":  "linesync.disconnect",
+                                             "title":  "LineSync: Disconnect",
+                                             "icon":  "$(circle-slash)"
+                                         },
+                                         {
+                                             "command":  "linesync.copySessionCode",
+                                             "title":  "LineSync: Copy Session Code"
+                                         },
+                                         {
+                                             "command":  "linesync.showMenu",
+                                             "title":  "LineSync: Show Menu"
+                                         },
+                                         {
+                                             "command":  "linesync.showBackups",
+                                             "title":  "LineSync: Show Backups / Restore Deleted Files"
+                                         },
+                                         {
+                                             "command":  "linesync.doctor",
+                                             "title":  "LineSync: Doctor"
+                                         },
+                                         {
+                                             "command":  "linesync.resyncFile",
+                                             "title":  "LineSync: Resync Current File"
+                                         },
+                                         {
+                                             "command":  "linesync.togglePause",
+                                             "title":  "LineSync: Pause/Resume Sync"
+                                         },
+                                         {
+                                             "command":  "linesync.explainIgnore",
+                                             "title":  "LineSync: Why Is This Ignored?"
+                                         }
+                                     ],
+                        "configuration":  {
+                                              "title":  "LineSync",
+                                              "properties":  {
+                                                                 "linesync.relayUrl":  {
+                                                                                           "type":  "string",
+                                                                                           "default":  "",
+                                                                                           "markdownDescription":  "WebSocket URL of your relay server, e.g. `wss://my-relay.onrender.com`. Use `auto` to select from `linesync.relayUrls`."
+                                                                                       },
+                                                                 "linesync.relayUrls":  {
+                                                                                            "type":  "array",
+                                                                                            "items":  {
+                                                                                                          "type":  "string"
+                                                                                                      },
+                                                                                            "default":  [
+                                                                                                            "wss://linesync-us.onrender.com",
+                                                                                                            "wss://linesync-de.onrender.com",
+                                                                                                            "wss://linesync-sg.onrender.com"
+                                                                                                        ],
+                                                                                            "markdownDescription":  "Optional list of relay URLs. If set, LineSync can auto-select the lowest-latency relay. Use `linesync.relayUrl` = `auto` to force auto selection."
+                                                                                        },
+                                                                 "linesync.relaySecret":  {
+                                                                                              "type":  "string",
+                                                                                              "default":  "",
+                                                                                              "markdownDescription":  "Shared secret for the relay server. Must match `RELAY_SECRET` env var on the server. Leave empty if the server has no auth."
+                                                                                          },
+                                                                 "linesync.userName":  {
+                                                                                           "type":  "string",
+                                                                                           "default":  "",
+                                                                                           "description":  "Your display name shown to peers. Leave empty to use a generated ID."
+                                                                                       },
+                                                                 "linesync.highlightDuration":  {
+                                                                                                    "type":  "number",
+                                                                                                    "default":  5000,
+                                                                                                    "description":  "How long (ms) to highlight lines changed by a peer."
+                                                                                                },
+                                                                 "linesync.maxFileSizeKB":  {
+                                                                                                "type":  "number",
+                                                                                                "default":  512,
+                                                                                                "markdownDescription":  "Files larger than this (in KB) are **skipped** during sync. Default: 512 KB. Increase if you need to sync large generated files."
+                                                                                            },
+                                                                 "linesync.ignorePatterns":  {
+                                                                                                 "type":  "array",
+                                                                                                 "items":  {
+                                                                                                               "type":  "string"
+                                                                                                           },
+                                                                                                "default":  [
+                                                                                                                "node_modules/",
+                                                                                                                ".git/",
+                                                                                                                "dist/",
+                                                                                                                "build/",
+                                                                                                                ".vscode/",
+                                                                                                                "__pycache__/",
+                                                                                                                ".next/",
+                                                                                                                ".nuxt/",
+                                                                                                                "*.lock",
+                                                                                                                "*.log",
+                                                                                                                "*.env",
+                                                                                                                "*.exe",
+                                                                                                                "*.zip",
+                                                                                                                "*.tar",
+                                                                                                                "*.gz",
+                                                                                                                "*.7z",
+                                                                                                                "*.rar",
+                                                                                                                "*.png",
+                                                                                                                "*.jpg",
+                                                                                                                "*.jpeg",
+                                                                                                                "*.gif",
+                                                                                                                "*.webp",
+                                                                                                                "*.bmp",
+                                                                                                                "*.pdf",
+                                                                                                                "*.mp3",
+                                                                                                                "*.mp4",
+                                                                                                                "*.mov",
+                                                                                                                "*.avi",
+                                                                                                                "*.mkv",
+                                                                                                                "*.wasm",
+                                                                                                                "*.dll",
+                                                                                                                "*.so",
+                                                                                                                "*.dylib",
+                                                                                                                "*.woff",
+                                                                                                                "*.woff2",
+                                                                                                                "*.ttf",
+                                                                                                                "*.otf"
+                                                                                                            ],
+                                                                                                 "description":  "Folder/file patterns to exclude from sync."
+                                                                                             },
+                                                                 "linesync.mergePolicy":  {
+                                                                                              "type":  "string",
+                                                                                              "default":  "prompt",
+                                                                                              "enum":  [
+                                                                                                           "prompt",
+                                                                                                           "preferMine",
+                                                                                                           "preferTheirs",
+                                                                                                           "preferHost"
+                                                                                                       ],
+                                                                                              "markdownDescription":  "Conflict resolution policy when auto-merge fails. `prompt` shows the UI, `preferMine` keeps your version, `preferTheirs` accepts remote, `preferHost` keeps host\u0027s version."
+                                                                                          }
+                                                             }
+                                          },
+                        "menus":  {
+                                      "editor/title":  [
+                                                           {
+                                                               "command":  "linesync.startSession",
+                                                               "group":  "navigation",
+                                                               "when":  "!linesync.active"
+                                                           },
+                                                           {
+                                                               "command":  "linesync.disconnect",
+                                                               "group":  "navigation",
+                                                               "when":  "linesync.active"
+                                                           }
+                                                       ],
+                                      "explorer/context": [
+                                        {
+                                          "command": "linesync.resyncFile",
+                                          "group": "navigation",
+                                          "when": "linesync.active && resourceScheme == file"
+                                        },
+                                        {
+                                          "command": "linesync.explainIgnore",
+                                          "group": "navigation",
+                                          "when": "resourceScheme == file"
+                                        }
+                                      ]
+                                  }
+                    },
+    "scripts":  {
+                    "vscode:prepublish":  "npm run typecheck \u0026\u0026 npm run bundle",
+                    "typecheck":  "tsc -p ./ --noEmit",
+                    "bundle":  "node build.mjs",
+                    "compile":  "npm run bundle",
+                    "watch":  "tsc -watch -p ./",
+                    "package":  "vsce package --no-dependencies"
+                },
+    "devDependencies":  {
+                            "@types/vscode":  "^1.80.0",
+                            "@types/node":  "^20.0.0",
+                            "@types/ws":  "^8.5.10",
+                            "@types/diff-match-patch":  "^1.0.36",
+                            "typescript":  "^5.3.0",
+                            "esbuild":  "^0.25.0",
+                            "@vscode/vsce":  "^2.24.0"
+                        },
+    "dependencies":  {
+                         "diff-match-patch":  "^1.0.5",
+                         "node-diff3":  "^3.2.0",
+                         "ws":  "^8.16.0"
+                     },
+    "license":  "MIT",
+    "repository":  {
+                       "url":  "https://github.com/wiktorekdev/linesync.git",
+                       "directory":  "extension",
+                       "type":  "git"
+                   }
+}

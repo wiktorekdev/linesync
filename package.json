@@ -1,0 +1,14 @@
+{
+  "name": "linesync",
+  "private": true,
+  "workspaces": [
+    "extension",
+    "relay"
+  ],
+  "scripts": {
+    "build": "npm --prefix extension run compile",
+    "package": "npm --prefix extension run package",
+    "start:relay": "npm --prefix relay run start",
+    "dev:relay": "npm --prefix relay run dev"
+  }
+}

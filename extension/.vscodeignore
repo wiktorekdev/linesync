@@ -1,0 +1,20 @@
+﻿# Exclude everything by default
+**/*
+
+# Include only runtime files
+!out/**
+!package.json
+!README.md
+!LICENSE
+!LICENSE.md
+!LICENSE.txt
+
+# Never include parent or dev files
+../**
+**/node_modules/**
+**/.git/**
+**/.vscode/**
+**/src/**
+**/tsconfig.json
+**/*.map
+**/*.log

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: Install
+        run: npm ci --workspaces=false
+        working-directory: extension
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: extension
+      - name: Build
+        run: npm run compile
+        working-directory: extension
+
+  build-relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm ci --workspaces=false
+        working-directory: relay
+      - name: Smoke
+        run: node --check index.js
+        working-directory: relay

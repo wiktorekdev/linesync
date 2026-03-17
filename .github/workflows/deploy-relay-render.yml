@@ -1,0 +1,28 @@
+name: Deploy Relay (Render)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "relay/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook (US)
+        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL_US != '' }}
+        run: curl -fsSL "$RENDER_DEPLOY_HOOK_URL_US"
+        env:
+          RENDER_DEPLOY_HOOK_URL_US: ${{ secrets.RENDER_DEPLOY_HOOK_URL_US }}
+      - name: Trigger Render deploy hook (DE)
+        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL_DE != '' }}
+        run: curl -fsSL "$RENDER_DEPLOY_HOOK_URL_DE"
+        env:
+          RENDER_DEPLOY_HOOK_URL_DE: ${{ secrets.RENDER_DEPLOY_HOOK_URL_DE }}
+      - name: Trigger Render deploy hook (SG)
+        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL_SG != '' }}
+        run: curl -fsSL "$RENDER_DEPLOY_HOOK_URL_SG"
+        env:
+          RENDER_DEPLOY_HOOK_URL_SG: ${{ secrets.RENDER_DEPLOY_HOOK_URL_SG }}
