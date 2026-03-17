@@ -4,26 +4,19 @@
 ![License](https://img.shields.io/github/license/wiktorekdev/linesync?label=license)
 ![Stars](https://img.shields.io/github/stars/wiktorekdev/linesync?style=social)
 
+US: [![relay-us](https://img.shields.io/website?label=relay-us&url=https%3A%2F%2Flinesync-us.onrender.com%2Fhealth)](https://linesync-us.onrender.com/health)
+DE: [![relay-de](https://img.shields.io/website?label=relay-de&url=https%3A%2F%2Flinesync-de.onrender.com%2Fhealth)](https://linesync-de.onrender.com/health)
+SG: [![relay-sg](https://img.shields.io/website?label=relay-sg&url=https%3A%2F%2Flinesync-sg.onrender.com%2Fhealth)](https://linesync-sg.onrender.com/health)
+
 Live file sync between VS Code instances. No commits, no branches, no merge ceremony.
 
 LineSync is a lightweight collaboration layer on top of git. Use it for pairing,
 mentoring, or quick sessions where "see my cursor and edits now" matters.
 
-## Repo Layout
-- `extension/` VS Code extension (TypeScript)
-- `relay/` WebSocket relay (Node.js)
-
 ## Install (VSIX)
 1. Download the latest `.vsix` from GitHub Releases.
 2. In VS Code: Extensions -> "..." menu -> "Install from VSIX..."
 3. Select the downloaded file.
-
-To publish a release:
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-The release workflow will build and attach the `.vsix`.
 
 ## 2-minute usage
 1. On the host: run `LineSync: Start New Session`
@@ -32,23 +25,6 @@ The release workflow will build and attach the `.vsix`.
 2. On the guest: run `LineSync: Join Session`
    - Paste the session code (or the join token)
    - Enter the password
-
-## Quickstart (Local)
-1. Relay
-```bash
-cd relay
-npm install
-npm run start
-```
-
-2. Extension (build)
-```bash
-cd extension
-npm install
-npm run compile
-npm run package
-```
-Install the generated `.vsix` in VS Code.
 
 ## Configure
 Set these in VS Code settings:
@@ -75,12 +51,6 @@ LineSync ships with three public relays and will auto-select the lowest-latency 
 - `wss://linesync-de.onrender.com` (Frankfurt, Germany)
 - `wss://linesync-sg.onrender.com` (Singapore)
 
-Health:
-
-- US: [![relay-us](https://img.shields.io/website?label=relay-us&url=https%3A%2F%2Flinesync-us.onrender.com%2Fhealth)](https://linesync-us.onrender.com/health)
-- DE: [![relay-de](https://img.shields.io/website?label=relay-de&url=https%3A%2F%2Flinesync-de.onrender.com%2Fhealth)](https://linesync-de.onrender.com/health)
-- SG: [![relay-sg](https://img.shields.io/website?label=relay-sg&url=https%3A%2F%2Flinesync-sg.onrender.com%2Fhealth)](https://linesync-sg.onrender.com/health)
-
 To force auto-selection explicitly:
 ```json
 {
@@ -99,7 +69,7 @@ To force auto-selection explicitly:
 
 Tip: the host can also copy a **join token** `ABCDEF.PASSWORD` (includes the password). If you paste it into the code prompt, LineSync will auto-fill the password.
 
-## Threat model (what is protected)
+## Security (threat model)
 LineSync uses a relay server to connect peers. The relay is designed to be stateless for file data, but it still sees metadata.
 
 What a public relay can see:
@@ -114,20 +84,6 @@ Encryption details:
 
 Not protected:
 - Metadata (timing, sizes) is not hidden by encryption.
-
-## Relay close codes
-These are the most common disconnect reasons from the relay:
-
-| Code | Meaning |
-|---:|---|
-| 4001 | Wrong relay secret (`RELAY_SECRET`) |
-| 4002 | Session full |
-| 4003 | Wrong session password |
-| 4004 | Password required |
-| 4007 | Heartbeat timeout |
-| 4008 | Rate limited (too many join attempts) |
-| 4010 | Kicked / banned by host |
-| 4011 | Banned from session |
 
 ## Limits and ignored files
 - LineSync skips large files (see `linesync.maxFileSizeKB`).

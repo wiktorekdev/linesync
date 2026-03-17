@@ -64,12 +64,22 @@ const server = http.createServer((req, res) => {
   const remoteIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
   const parsed = url.parse(req.url || '', true);
 
-  if (req.method === 'GET' && parsed.pathname === '/health') {
+  if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/health') {
+    if (req.method === 'HEAD') {
+      res.statusCode = 200;
+      res.end();
+      return;
+    }
     sendJson(res, 200, { ok: true });
     return;
   }
 
-  if (req.method === 'GET' && parsed.pathname === '/config') {
+  if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/config') {
+    if (req.method === 'HEAD') {
+      res.statusCode = 200;
+      res.end();
+      return;
+    }
     sendJson(res, 200, { requirePassword: true });
     return;
   }
