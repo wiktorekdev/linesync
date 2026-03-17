@@ -104,6 +104,9 @@ export class SyncEngine {
   private lastConflictHintAt = new Map<string, number>();
   private conflictHintInFlight = new Set<string>();
   private readOnlyHintAt = 0;
+  private manifestSyncTimer: ReturnType<typeof setInterval> | null = null;
+  private initialManifestReceived = false;
+  private desyncEditHintAt = 0;
 
   private disposables: vscode.Disposable[] = [];
 
@@ -183,6 +186,7 @@ export class SyncEngine {
 
     for (const doc of vscode.workspace.textDocuments) this.trackDocument(doc);
     this.startDriftSweep();
+    this.startManifestSync();
   }
 
   dispose() {
@@ -195,6 +199,10 @@ export class SyncEngine {
     if (this.driftSweepTimer) {
       clearInterval(this.driftSweepTimer);
       this.driftSweepTimer = null;
+    }
+    if (this.manifestSyncTimer) {
+      clearInterval(this.manifestSyncTimer);
+      this.manifestSyncTimer = null;
     }
     for (const timer of this.driftCheckTimers.values()) clearTimeout(timer);
     this.driftCheckTimers.clear();
@@ -219,6 +227,10 @@ export class SyncEngine {
       this.peers.clear();
       for (const p of e.peers) this.peers.set(String(p.peerId), String(p.peerName || ''));
       this.recomputeHost();
+      if (!this.isHost) {
+        // Guests should hydrate missing files from host state as soon as session metadata arrives.
+        void this.requestManifest();
+      }
       // Ensure our awareness has the stable relay peerId.
       const s: any = this.docPresence.awareness.getLocalState() ?? {};
       this.docPresence.setLocal(this.myName, this.myPeerId, {
@@ -262,17 +274,19 @@ export class SyncEngine {
         return;
       }
       if (p.type === 'manifest_request') {
-        if (this.isHost) this.sendManifest();
+        this.sendManifest();
         return;
       }
       if (p.type === 'manifest') {
         this.remoteManifest = Array.isArray((p as any).files) ? (p as any).files : [];
+        this.initialManifestReceived = true;
+        this.reconcileWithRemoteManifest();
         return;
       }
       if (p.type === 'snapshot_request') {
         const file = this.normalizeRelativePath(p.file);
         if (!file || this.isIgnored(file)) return;
-        if (this.isHost) this.handleSnapshotRequest(file);
+        if (this.hasLocalFileForSnapshot(file)) this.handleSnapshotRequest(file);
         return;
       }
       if (p.type === 'snapshot_chunk') {
@@ -389,7 +403,30 @@ export class SyncEngine {
       this.rejectPeerEdit(rel);
       return;
     }
+
+    if (this.sessionMode === 'guest' && !this.initialManifestReceived) {
+      // Prevent early local writes before baseline sync is established.
+      this.requestManifest();
+      this.requestSnapshot(rel);
+      this.showDesyncEditHint(rel, 'LineSync: Waiting for baseline sync. Edit was paused to prevent line drift.').catch(() => {});
+      return;
+    }
+
     const entry = this.store.getOrCreate(rel);
+    const entryBefore = entry.text.toString();
+    const simulatedAfter = this.applyChangesToString(entryBefore, e.contentChanges);
+    const actualAfter = doc.getText();
+    if (simulatedAfter !== actualAfter) {
+      // We detected offset drift: do not apply unsafe delta ops.
+      if (this.sessionMode === 'host') {
+        this.replaceDocWithText(entry, actualAfter);
+      } else {
+        this.requestSnapshot(rel);
+        this.showDesyncEditHint(rel, `LineSync: Detected line drift in ${rel}. Requested safe resync.`).catch(() => {});
+      }
+      this.scheduleDriftCheck(rel, 80);
+      return;
+    }
 
     // Apply delta edits from VS Code to Y.Text.
     // Process from end -> start to keep offsets stable.
@@ -402,6 +439,32 @@ export class SyncEngine {
       }
     }, 'local');
     this.scheduleDriftCheck(rel, 220);
+  }
+
+  private applyChangesToString(base: string, changes: readonly vscode.TextDocumentContentChangeEvent[]): string {
+    let next = base;
+    const ordered = [...changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
+    for (const c of ordered) {
+      const start = Math.max(0, Math.min(next.length, c.rangeOffset));
+      const end = Math.max(start, Math.min(next.length, c.rangeOffset + c.rangeLength));
+      next = `${next.slice(0, start)}${c.text}${next.slice(end)}`;
+    }
+    return next;
+  }
+
+  private replaceDocWithText(entry: { doc: Y.Doc; text: Y.Text }, content: string) {
+    entry.doc.transact(() => {
+      if (entry.text.length > 0) entry.text.delete(0, entry.text.length);
+      if (content) entry.text.insert(0, content);
+    }, 'local');
+  }
+
+  private async showDesyncEditHint(file: string, message: string) {
+    const now = Date.now();
+    if (now - this.desyncEditHintAt < 6000) return;
+    this.desyncEditHintAt = now;
+    const action = await vscode.window.showWarningMessage(message, 'Resync now');
+    if (action === 'Resync now') this.requestSnapshot(file);
   }
 
   private isPeerReadOnly(): boolean {
@@ -440,8 +503,29 @@ export class SyncEngine {
     } finally {
       this.applyingRemote.delete(file);
     }
+    this.materializeRemoteDocToWorkspace(file);
     this.scheduleDriftCheck(file, 180);
     // Optional: highlight changed lines later (presence-ui todo)
+  }
+
+  private materializeRemoteDocToWorkspace(file: string) {
+    const safe = this.safeWorkspacePath(file);
+    if (!safe) return;
+
+    // If file is currently open in editor, doc<->editor sync already handles it.
+    const isOpen = vscode.workspace.textDocuments.some(
+      (d) => d.uri.scheme === 'file' && d.uri.fsPath === safe.abs
+    );
+    if (isOpen) return;
+
+    const entry = this.store.getOrCreate(file);
+    const content = entry.text.toString();
+    try {
+      fs.mkdirSync(path.dirname(safe.abs), { recursive: true });
+      fs.writeFileSync(safe.abs, content, 'utf8');
+    } catch {
+      // ignore
+    }
   }
 
   private async applyDocToEditor(file: string) {
@@ -658,6 +742,40 @@ export class SyncEngine {
       this.transport.send({ type: 'manifest', files } satisfies Payload);
     } catch {
       // ignore
+    }
+  }
+
+  private reconcileWithRemoteManifest() {
+    for (const item of this.remoteManifest) {
+      const rel = this.normalizeRelativePath(item.file);
+      if (!rel || this.isIgnored(rel)) continue;
+      const safe = this.safeWorkspacePath(rel);
+      if (!safe) continue;
+
+      let localMissing = false;
+      let localSize = -1;
+      try {
+        const stat = fs.statSync(safe.abs);
+        if (!stat.isFile()) localMissing = true;
+        else localSize = stat.size;
+      } catch {
+        localMissing = true;
+      }
+
+      const remoteSize = Number(item.size ?? -1);
+      const sizeDiffers = !localMissing && remoteSize >= 0 && localSize >= 0 && localSize !== remoteSize;
+      if (localMissing || sizeDiffers) this.requestSnapshot(rel);
+    }
+  }
+
+  private hasLocalFileForSnapshot(file: string): boolean {
+    if (this.store.has(file)) return true;
+    const safe = this.safeWorkspacePath(file);
+    if (!safe) return false;
+    try {
+      return fs.statSync(safe.abs).isFile();
+    } catch {
+      return false;
     }
   }
 
@@ -970,6 +1088,13 @@ export class SyncEngine {
   private startDriftSweep() {
     if (this.driftSweepTimer) clearInterval(this.driftSweepTimer);
     this.driftSweepTimer = setInterval(() => this.runDriftSweep(), this.driftCheckIntervalMs);
+  }
+
+  private startManifestSync() {
+    if (this.manifestSyncTimer) clearInterval(this.manifestSyncTimer);
+    this.manifestSyncTimer = setInterval(() => {
+      void this.requestManifest();
+    }, 12_000);
   }
 
   private runDriftSweep() {
