@@ -1,6 +1,13 @@
 const WebSocket = require('ws');
 const { randomUUID } = require('crypto');
-const { SIZE_LIMITS, RATE_LIMIT, RATE_WINDOW_MS, MAX_SESSION_PEERS } = require('./constants');
+const {
+  SIZE_LIMITS,
+  RATE_LIMIT,
+  RATE_WINDOW_MS,
+  MAX_SESSION_PEERS,
+  MAX_BANNED_IPS_PER_SESSION,
+  MAX_BANNED_TOKENS_PER_SESSION,
+} = require('./constants');
 const { normalizeSessionId, sanitizePeerName } = require('./ids');
 const { remoteIpFromReq } = require('./httpRoutes');
 
@@ -10,8 +17,12 @@ function createWsServer(opts) {
     secret,
     sessionStore,
     joinLimiter,
+    authFailLimiter,
     onStateChanged,
     log,
+    trustProxy,
+    maxBannedIpsPerSession = MAX_BANNED_IPS_PER_SESSION,
+    maxBannedTokensPerSession = MAX_BANNED_TOKENS_PER_SESSION,
   } = opts;
 
   const msgCount = new WeakMap();
@@ -55,12 +66,30 @@ function createWsServer(opts) {
   };
 
   const getHostPeerId = (session) => {
-    const ids = [...session.peers.keys()].sort();
-    return ids[0] || null;
+    if (!session || !session.hostClientToken) return null;
+    for (const [peerId, peer] of session.peers) {
+      if (peer.token && peer.token === session.hostClientToken) return peerId;
+    }
+    return null;
   };
 
+  const isHostPeer = (session, peerId) => {
+    if (!session || !peerId || !session.hostClientToken) return false;
+    const peer = session.peers.get(peerId);
+    if (!peer || !peer.token) return false;
+    return peer.token === session.hostClientToken;
+  };
+
+  const isValidClientToken = (value) => {
+    const token = String(value || '').trim();
+    if (!token || token.length > 128) return false;
+    return /^[A-Za-z0-9_-]{16,128}$/.test(token);
+  };
+
+  const hitAuthFail = (ip) => !!(authFailLimiter && authFailLimiter.hit(`ws:${ip}`));
+
   wss.on('connection', (ws, req) => {
-    const remoteIp = remoteIpFromReq(req);
+    const remoteIp = remoteIpFromReq(req, trustProxy);
     let currentSessionId = null;
     let currentPeerId = null;
     ws._lastHeartbeatAt = Date.now();
@@ -100,8 +129,13 @@ function createWsServer(opts) {
           }
 
           if (secret && msg.secret !== secret) {
-            send(ws, { type: 'error', code: 'unauthorized', message: 'Wrong secret' });
-            ws.close(4001, 'Unauthorized');
+            const limited = hitAuthFail(remoteIp);
+            send(ws, {
+              type: 'error',
+              code: limited ? 'auth_rate_limited' : 'unauthorized',
+              message: limited ? 'Too many failed auth attempts' : 'Wrong secret',
+            });
+            ws.close(limited ? 4008 : 4001, limited ? 'Auth rate limited' : 'Unauthorized');
             return;
           }
 
@@ -113,7 +147,8 @@ function createWsServer(opts) {
 
           const session = sessionStore.ensure(sessionId);
           if (!session) {
-            send(ws, { type: 'error', code: 'bad_session', message: 'Invalid session id' });
+            send(ws, { type: 'error', code: 'session_capacity_reached', message: 'Relay capacity reached' });
+            ws.close(1013, 'Try again later');
             return;
           }
 
@@ -125,13 +160,23 @@ function createWsServer(opts) {
           }
 
           if (session.passwordHash && incomingPasswordHash !== session.passwordHash) {
-            send(ws, { type: 'error', code: 'bad_password', message: 'Invalid session token' });
-            ws.close(4003, 'Invalid session token');
+            const limited = hitAuthFail(remoteIp);
+            send(ws, {
+              type: 'error',
+              code: limited ? 'auth_rate_limited' : 'bad_password',
+              message: limited ? 'Too many failed auth attempts' : 'Invalid session token',
+            });
+            ws.close(limited ? 4008 : 4003, limited ? 'Auth rate limited' : 'Invalid session token');
             return;
           }
 
-          const clientToken = String(msg.clientToken || '').substring(0, 128);
-          if (session.bannedIps.has(remoteIp) || (clientToken && session.bannedTokens.has(clientToken))) {
+          if (!isValidClientToken(msg.clientToken)) {
+            send(ws, { type: 'error', code: 'bad_client_token', message: 'Invalid client token' });
+            ws.close(4005, 'Invalid client token');
+            return;
+          }
+          const clientToken = String(msg.clientToken).trim();
+          if (session.bannedIps.has(remoteIp) || session.bannedTokens.has(clientToken)) {
             send(ws, { type: 'error', code: 'banned', message: 'You are banned from this session' });
             ws.close(4011, 'Banned');
             return;
@@ -149,6 +194,11 @@ function createWsServer(opts) {
             onStateChanged();
             log('session_created', { session: sessionId });
           }
+          if (!session.hostClientToken) {
+            session.hostClientToken = clientToken;
+            session.updatedAt = Date.now();
+            onStateChanged();
+          }
 
           currentSessionId = sessionId;
           currentPeerId = randomUUID();
@@ -159,7 +209,13 @@ function createWsServer(opts) {
             peerName: peer.name,
           }));
 
-          send(ws, { type: 'session_info', peerId: currentPeerId, peers: existingPeers });
+          send(ws, {
+            type: 'session_info',
+            peerId: currentPeerId,
+            peers: existingPeers,
+            hostPeerId: session.hostClientToken === clientToken ? currentPeerId : getHostPeerId(session),
+            isHost: session.hostClientToken === clientToken,
+          });
           broadcast(sessionId, { type: 'peer_joined', peerId: currentPeerId, peerName }, currentPeerId);
 
           session.peers.set(currentPeerId, {
@@ -167,9 +223,10 @@ function createWsServer(opts) {
             name: peerName,
             joinedAt: Date.now(),
             ip: remoteIp,
-            token: clientToken || null,
+            token: clientToken,
           });
           session.updatedAt = Date.now();
+          onStateChanged();
 
           log('peer_joined', {
             session: sessionId,
@@ -195,8 +252,7 @@ function createWsServer(opts) {
           if (!currentSessionId || !currentPeerId) return;
           const session = sessionStore.get(currentSessionId);
           if (!session) return;
-          const hostId = getHostPeerId(session);
-          if (hostId !== currentPeerId) {
+          if (!isHostPeer(session, currentPeerId)) {
             send(ws, { type: 'error', code: 'forbidden', message: 'Host only' });
             return;
           }
@@ -207,8 +263,8 @@ function createWsServer(opts) {
           if (!targetPeer) return;
 
           if (msg.type === 'admin_ban') {
-            session.bannedIps.add(targetPeer.ip);
-            if (targetPeer.token) session.bannedTokens.add(targetPeer.token);
+            addToCappedSet(session.bannedIps, targetPeer.ip, maxBannedIpsPerSession);
+            addToCappedSet(session.bannedTokens, targetPeer.token, maxBannedTokensPerSession);
             session.updatedAt = Date.now();
             onStateChanged();
           }
@@ -243,6 +299,7 @@ function createWsServer(opts) {
       const peer = session.peers.get(currentPeerId);
       session.peers.delete(currentPeerId);
       session.updatedAt = Date.now();
+      onStateChanged();
 
       broadcast(currentSessionId, { type: 'peer_left', peerId: currentPeerId }, currentPeerId);
       log('peer_left', {
@@ -253,9 +310,7 @@ function createWsServer(opts) {
       });
 
       if (session.peers.size === 0) {
-        sessionStore.delete(currentSessionId);
-        onStateChanged();
-        log('session_closed', { session: currentSessionId });
+        log('session_empty', { session: currentSessionId });
       }
     });
 
@@ -271,9 +326,11 @@ function createWsServer(opts) {
   setInterval(() => {
     const now = Date.now();
     sessionStore.forEach((session, sid) => {
+      let sessionChanged = false;
       for (const [pid, peer] of session.peers) {
         if (peer.ws.readyState !== WebSocket.OPEN) {
           session.peers.delete(pid);
+          sessionChanged = true;
           continue;
         }
         const last = peer.ws._lastHeartbeatAt || peer.joinedAt;
@@ -284,11 +341,13 @@ function createWsServer(opts) {
             // ignore
           }
           session.peers.delete(pid);
+          sessionChanged = true;
         }
       }
-      if (session.peers.size === 0) {
-        sessionStore.delete(sid);
+      if (sessionChanged) {
+        session.updatedAt = now;
         onStateChanged();
+        if (session.peers.size === 0) log('session_empty', { session: sid });
       }
     });
   }, 10_000);
@@ -314,6 +373,22 @@ function isValidEncEnvelope(msg) {
   if (iv.length !== 12) return false;
   if (data.length < 16) return false;
   return true;
+}
+
+function addToCappedSet(targetSet, value, maxSize) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return;
+
+  if (targetSet.has(normalized)) targetSet.delete(normalized);
+  targetSet.add(normalized);
+
+  const cap = Number(maxSize);
+  if (!Number.isFinite(cap) || cap <= 0) return;
+  while (targetSet.size > cap) {
+    const oldest = targetSet.values().next().value;
+    if (typeof oldest === 'undefined') break;
+    targetSet.delete(oldest);
+  }
 }
 
 module.exports = {

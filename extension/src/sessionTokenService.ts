@@ -23,9 +23,10 @@ export function isLikelySessionToken(value: string): boolean {
 export async function issueSessionToken(
   relayWsUrl: string,
   relaySecret: string,
-  timeoutMs: number
+  timeoutMs: number,
+  allowInsecure = false
 ): Promise<IssuedSessionToken> {
-  const base = wsToHttpBase(relayWsUrl);
+  const base = wsToHttpBase(relayWsUrl, allowInsecure);
   const payload = await httpPostJson<unknown>(
     `${base}/session-token`,
     {},
@@ -39,9 +40,10 @@ export async function resolveSessionTokenOnRelay(
   relayWsUrl: string,
   token: string,
   relaySecret: string,
-  timeoutMs: number
+  timeoutMs: number,
+  allowInsecure = false
 ): Promise<ResolvedSessionToken> {
-  const base = wsToHttpBase(relayWsUrl);
+  const base = wsToHttpBase(relayWsUrl, allowInsecure);
   const payload = await httpPostJson<unknown>(
     `${base}/session-token/resolve`,
     { token },
@@ -55,9 +57,10 @@ export async function revokeSessionTokenOnRelay(
   relayWsUrl: string,
   token: string,
   relaySecret: string,
-  timeoutMs: number
+  timeoutMs: number,
+  allowInsecure = false
 ): Promise<void> {
-  const base = wsToHttpBase(relayWsUrl);
+  const base = wsToHttpBase(relayWsUrl, allowInsecure);
   await httpPostJson<unknown>(
     `${base}/session-token/revoke`,
     { token },
@@ -66,10 +69,11 @@ export async function revokeSessionTokenOnRelay(
   );
 }
 
-function wsToHttpBase(relayWsUrl: string): string {
+function wsToHttpBase(relayWsUrl: string, allowInsecure: boolean): string {
   const trimmed = relayWsUrl.trim();
   if (trimmed.startsWith('wss://')) return `https://${trimmed.slice('wss://'.length)}`;
-  if (trimmed.startsWith('ws://')) return `http://${trimmed.slice('ws://'.length)}`;
+  if (trimmed.startsWith('ws://') && allowInsecure) return `http://${trimmed.slice('ws://'.length)}`;
+  if (trimmed.startsWith('ws://')) throw new Error('Insecure relay is blocked. Use wss:// (ws:// is allowed only for localhost).');
   throw new Error('Invalid relay URL');
 }
 

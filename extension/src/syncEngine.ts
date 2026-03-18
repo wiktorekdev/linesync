@@ -67,6 +67,7 @@ export class SyncEngine {
   private myPeerId = '';
   private peers = new Map<string, string>(); // peerId -> name
   private isHost = false;
+  private hostRoleFromRelay = false;
 
   private store = new DocStore();
   private docPresence = new Presence(new Y.Doc());
@@ -75,6 +76,7 @@ export class SyncEngine {
   private suppressEditorToDoc = new Set<string>();
   private maxFileSizeBytes: number;
   private peerMode: 'edit' | 'readOnly' = 'edit';
+  private remoteFilesMode: 'previewOnly' | 'autoMirrorMissing' = 'previewOnly';
   private autoResyncOnDrift = true;
   private driftCheckIntervalMs = 2500;
   private autoResyncCooldownMs = 15_000;
@@ -93,6 +95,10 @@ export class SyncEngine {
   private lastManifestSentAt = 0;
 
   private lastPresenceByPeerId = new Map<string, { file: string; line: number; character: number }>();
+  private focusFollowPeerId: string | null = null;
+  private focusFollowLastPosKey = '';
+  private focusFollowTimer: ReturnType<typeof setTimeout> | null = null;
+  private focusFollowInFlight = false;
 
   private persistDir: string | null = null;
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -116,7 +122,8 @@ export class SyncEngine {
     private decorationManager: DecorationManager,
     private context: vscode.ExtensionContext,
     private sessionId: string,
-    private sessionMode: 'host' | 'guest'
+    private sessionMode: 'host' | 'guest',
+    private onPeerPresenceByFile?: (presenceByFile: Map<string, string[]>) => void
   ) {
     this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
     this.maxFileSizeBytes = 512 * 1024;
@@ -138,18 +145,8 @@ export class SyncEngine {
     this.disposables.push(
       vscode.window.onDidChangeTextEditorSelection((e) => {
         if (!this.myPeerId) return;
-        const rel = toRel(this.root, e.textEditor.document.uri.fsPath);
-        if (!rel) return;
-        const sel = e.selections[0];
-        const active = sel?.active ?? new vscode.Position(0, 0);
-        const anchor = sel?.anchor ?? active;
-        const selection = sel && !sel.isEmpty
-          ? {
-              anchor: { line: anchor.line, character: anchor.character },
-              active: { line: active.line, character: active.character },
-            }
-          : null;
-        this.docPresence.setLocal(this.myName, this.myPeerId, { file: rel, line: active.line, character: active.character, selection });
+        if (vscode.window.activeTextEditor?.document.uri.toString() !== e.textEditor.document.uri.toString()) return;
+        this.publishLocalPresence(e.textEditor, e.selections[0]);
       })
     );
 
@@ -166,11 +163,21 @@ export class SyncEngine {
       vscode.workspace.onDidOpenTextDocument((doc) => this.trackDocument(doc)),
       vscode.workspace.onDidCloseTextDocument((doc) => this.untrackDocumentIfClosed(doc)),
       vscode.workspace.onDidChangeTextDocument((e) => this.onTextChanged(e)),
+      vscode.workspace.onDidCreateFiles(() => {
+        if (this.sessionMode === 'host' && this.isHost) void this.sendManifest();
+      }),
+      vscode.workspace.onDidDeleteFiles(() => {
+        if (this.sessionMode === 'host' && this.isHost) void this.sendManifest();
+      }),
+      vscode.workspace.onDidRenameFiles(() => {
+        if (this.sessionMode === 'host' && this.isHost) void this.sendManifest();
+      }),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (
           e.affectsConfiguration('linesync.ignorePatterns')
           || e.affectsConfiguration('linesync.maxFileSizeKB')
           || e.affectsConfiguration('linesync.peerMode')
+          || e.affectsConfiguration('linesync.remoteFilesMode')
           || e.affectsConfiguration('linesync.autoResyncOnDrift')
           || e.affectsConfiguration('linesync.driftCheckIntervalMs')
           || e.affectsConfiguration('linesync.autoResyncCooldownMs')
@@ -204,6 +211,10 @@ export class SyncEngine {
       clearInterval(this.manifestSyncTimer);
       this.manifestSyncTimer = null;
     }
+    if (this.focusFollowTimer) {
+      clearTimeout(this.focusFollowTimer);
+      this.focusFollowTimer = null;
+    }
     for (const timer of this.driftCheckTimers.values()) clearTimeout(timer);
     this.driftCheckTimers.clear();
     this.driftMismatchCount.clear();
@@ -226,7 +237,13 @@ export class SyncEngine {
       this.myPeerId = e.peerId;
       this.peers.clear();
       for (const p of e.peers) this.peers.set(String(p.peerId), String(p.peerName || ''));
-      this.recomputeHost();
+      if (typeof e.isHost === 'boolean') {
+        this.isHost = e.isHost;
+        this.hostRoleFromRelay = true;
+      } else {
+        this.hostRoleFromRelay = false;
+        this.recomputeHost();
+      }
       if (!this.isHost) {
         // Guests should hydrate missing files from host state as soon as session metadata arrives.
         void this.requestManifest();
@@ -243,7 +260,7 @@ export class SyncEngine {
     }
     if (e.type === 'peer_joined') {
       this.peers.set(e.peerId, e.peerName);
-      this.recomputeHost();
+      if (!this.hostRoleFromRelay) this.recomputeHost();
       if (this.isHost) {
         // send current state of opened docs
         for (const [file, entry] of this.store.entries()) {
@@ -251,13 +268,20 @@ export class SyncEngine {
           const updateB64 = Buffer.from(update).toString('base64');
           this.transport.send({ type: 'y_update', file, updateB64 } satisfies Payload);
         }
+        void this.sendManifest();
       }
       return;
     }
     if (e.type === 'peer_left') {
       this.peers.delete(e.peerId);
+      this.lastPresenceByPeerId.delete(e.peerId);
       this.decorationManager.clearPeer(e.peerId);
-      this.recomputeHost();
+      this.emitPeerPresenceByFile();
+      if (this.focusFollowPeerId === e.peerId) {
+        this.stopFocusFollowMode(false);
+        vscode.window.showInformationMessage('LineSync: Focus follow stopped (peer left).');
+      }
+      if (!this.hostRoleFromRelay) this.recomputeHost();
       return;
     }
     if (e.type === 'enc') {
@@ -274,7 +298,7 @@ export class SyncEngine {
         return;
       }
       if (p.type === 'manifest_request') {
-        this.sendManifest();
+        if (this.isHost) this.sendManifest();
         return;
       }
       if (p.type === 'manifest') {
@@ -305,6 +329,7 @@ export class SyncEngine {
   }
 
   private recomputeHost() {
+    if (this.hostRoleFromRelay) return;
     if (!this.myPeerId) return;
     const ids = [this.myPeerId, ...this.peers.keys()].sort();
     const hostId = ids[0] ?? '';
@@ -330,16 +355,29 @@ export class SyncEngine {
     // Apply persisted CRDT state first (if any).
     this.loadPersistedDoc(rel).catch(() => {});
 
-    // Initialize doc content once
-    if (entry.text.length === 0 && doc.getText().length > 0) {
+    const localText = doc.getText();
+    const remoteHasFile = this.remoteManifest.some((item) => this.normalizeRelativePath(item.file) === rel);
+    const canSeedFromLocal = this.sessionMode === 'host'
+      || (this.sessionMode === 'guest' && this.initialManifestReceived && !remoteHasFile);
+
+    // Initialize doc content once.
+    if (canSeedFromLocal && entry.text.length === 0 && localText.length > 0) {
       entry.doc.transact(() => {
-        entry.text.insert(0, doc.getText());
+        entry.text.insert(0, localText);
       }, 'init');
+    }
+    if (this.sessionMode === 'guest' && !this.initialManifestReceived) {
+      this.requestSnapshot(rel);
+    } else if (this.sessionMode === 'guest' && remoteHasFile && entry.text.length === 0) {
+      this.requestSnapshot(rel);
     }
 
     // Broadcast and persist doc updates.
     const onDocUpdate = (update: Uint8Array, origin: any) => {
-      if (origin !== 'remote') {
+      const shouldBroadcast = origin !== 'remote'
+        && origin !== 'persist'
+        && !(this.sessionMode === 'guest' && !this.initialManifestReceived);
+      if (shouldBroadcast) {
         const updateB64 = Buffer.from(update).toString('base64');
         this.transport.send({ type: 'y_update', file: rel, updateB64 } satisfies Payload);
       }
@@ -389,6 +427,27 @@ export class SyncEngine {
     this.clearDriftTracking(rel);
   }
 
+  private publishLocalPresence(editor: vscode.TextEditor, selection?: vscode.Selection) {
+    if (!this.myPeerId) return;
+    const rel = toRel(this.root, editor.document.uri.fsPath);
+    if (!rel) return;
+    const sel = selection ?? editor.selection;
+    const active = sel?.active ?? new vscode.Position(0, 0);
+    const anchor = sel?.anchor ?? active;
+    const payloadSelection = sel && !sel.isEmpty
+      ? {
+          anchor: { line: anchor.line, character: anchor.character },
+          active: { line: active.line, character: active.character },
+        }
+      : null;
+    this.docPresence.setLocal(this.myName, this.myPeerId, {
+      file: rel,
+      line: active.line,
+      character: active.character,
+      selection: payloadSelection,
+    });
+  }
+
   private onTextChanged(e: vscode.TextDocumentChangeEvent) {
     const doc = e.document;
     if (!isTextDoc(doc)) return;
@@ -401,6 +460,8 @@ export class SyncEngine {
     if (this.suppressEditorToDoc.has(rel)) return;
     if (this.isPeerReadOnly()) {
       this.rejectPeerEdit(rel);
+      const editor = vscode.window.visibleTextEditors.find((ed) => ed.document.uri.toString() === doc.uri.toString());
+      if (editor) this.publishLocalPresence(editor);
       return;
     }
 
@@ -409,14 +470,28 @@ export class SyncEngine {
       this.requestManifest();
       this.requestSnapshot(rel);
       this.showDesyncEditHint(rel, 'LineSync: Waiting for baseline sync. Edit was paused to prevent line drift.').catch(() => {});
+      const editor = vscode.window.visibleTextEditors.find((ed) => ed.document.uri.toString() === doc.uri.toString());
+      if (editor) this.publishLocalPresence(editor);
       return;
     }
 
     const entry = this.store.getOrCreate(rel);
-    const entryBefore = entry.text.toString();
-    const simulatedAfter = this.applyChangesToString(entryBefore, e.contentChanges);
-    const actualAfter = doc.getText();
-    if (simulatedAfter !== actualAfter) {
+
+    // Validate that local editor ranges still match CRDT offsets before applying.
+    const changes = [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset);
+    let expectedLength = entry.text.length;
+    let hasInvalidRange = false;
+    for (const c of changes) {
+      const start = c.rangeOffset;
+      const end = c.rangeOffset + c.rangeLength;
+      if (start < 0 || c.rangeLength < 0 || start > expectedLength || end > expectedLength) {
+        hasInvalidRange = true;
+        break;
+      }
+      expectedLength = expectedLength - c.rangeLength + c.text.length;
+    }
+    if (hasInvalidRange) {
+      const actualAfter = doc.getText();
       // We detected offset drift: do not apply unsafe delta ops.
       if (this.sessionMode === 'host') {
         this.replaceDocWithText(entry, actualAfter);
@@ -425,12 +500,13 @@ export class SyncEngine {
         this.showDesyncEditHint(rel, `LineSync: Detected line drift in ${rel}. Requested safe resync.`).catch(() => {});
       }
       this.scheduleDriftCheck(rel, 80);
+      const editor = vscode.window.visibleTextEditors.find((ed) => ed.document.uri.toString() === doc.uri.toString());
+      if (editor) this.publishLocalPresence(editor);
       return;
     }
 
     // Apply delta edits from VS Code to Y.Text.
     // Process from end -> start to keep offsets stable.
-    const changes = [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset);
     entry.doc.transact(() => {
       for (const c of changes) {
         const delLen = c.rangeLength;
@@ -438,18 +514,9 @@ export class SyncEngine {
         if (c.text) entry.text.insert(c.rangeOffset, c.text);
       }
     }, 'local');
+    const editor = vscode.window.visibleTextEditors.find((ed) => ed.document.uri.toString() === doc.uri.toString());
+    if (editor) this.publishLocalPresence(editor);
     this.scheduleDriftCheck(rel, 220);
-  }
-
-  private applyChangesToString(base: string, changes: readonly vscode.TextDocumentContentChangeEvent[]): string {
-    let next = base;
-    const ordered = [...changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
-    for (const c of ordered) {
-      const start = Math.max(0, Math.min(next.length, c.rangeOffset));
-      const end = Math.max(start, Math.min(next.length, c.rangeOffset + c.rangeLength));
-      next = `${next.slice(0, start)}${c.text}${next.slice(end)}`;
-    }
-    return next;
   }
 
   private replaceDocWithText(entry: { doc: Y.Doc; text: Y.Text }, content: string) {
@@ -563,7 +630,6 @@ export class SyncEngine {
       }
       if (typeof d.insert === 'string') {
         ops.push({ kind: 'insert', offset: index, text: d.insert });
-        index += d.insert.length;
         continue;
       }
       if (typeof d.delete === 'number') {
@@ -626,20 +692,40 @@ export class SyncEngine {
 
   private renderRemotePresence() {
     // Map awareness states to DecorationManager cursors/selections
+    const nextPresenceByPeerId = new Map<string, { file: string; line: number; character: number }>();
     for (const [clientId, state] of this.docPresence.awareness.getStates()) {
       const s: any = state;
       const peerId = typeof s?.peerId === 'string' && s.peerId ? s.peerId : String(clientId);
       if (peerId === this.myPeerId) continue;
       const nameFromRelay = this.peers.get(peerId) ?? '';
       const name = nameFromRelay || String(s?.name || '');
-      const file = typeof s?.file === 'string' ? s.file : null;
-      const line = typeof s?.line === 'number' ? s.line : null;
-      const character = typeof s?.character === 'number' ? s.character : 0;
+      const fileRaw = typeof s?.file === 'string' ? s.file : null;
+      const file = fileRaw ? this.normalizeRelativePath(fileRaw) : null;
+      const line = typeof s?.line === 'number' && Number.isFinite(s.line) ? Math.max(0, Math.floor(s.line)) : null;
+      const character = typeof s?.character === 'number' && Number.isFinite(s.character) ? Math.max(0, Math.floor(s.character)) : 0;
       const selection = s?.selection ?? null;
       if (!file || line === null) continue;
-      this.lastPresenceByPeerId.set(peerId, { file, line, character });
+      if (this.isIgnored(file)) continue;
+      nextPresenceByPeerId.set(peerId, { file, line, character });
       this.decorationManager.updateCursor(peerId, file, line, character, selection, name || 'Peer');
     }
+    for (const peerId of this.lastPresenceByPeerId.keys()) {
+      if (!nextPresenceByPeerId.has(peerId)) this.decorationManager.clearPeer(peerId);
+    }
+    this.lastPresenceByPeerId = nextPresenceByPeerId;
+    this.emitPeerPresenceByFile();
+    this.scheduleFocusFollowUpdate();
+  }
+
+  private emitPeerPresenceByFile() {
+    if (!this.onPeerPresenceByFile) return;
+    const byFile = new Map<string, string[]>();
+    for (const [peerId, pos] of this.lastPresenceByPeerId) {
+      const arr = byFile.get(pos.file) ?? [];
+      arr.push(peerId);
+      byFile.set(pos.file, arr);
+    }
+    this.onPeerPresenceByFile(byFile);
   }
 
   async requestManifest(): Promise<void> {
@@ -652,7 +738,7 @@ export class SyncEngine {
   async showRemoteFileBrowser(): Promise<void> {
     await this.requestManifest();
     if (!this.remoteManifest.length) {
-      vscode.window.showInformationMessage('LineSync: Waiting for file list from host...');
+      vscode.window.showInformationMessage('LineSync: Waiting for peer file list...');
       return;
     }
     const picks = this.remoteManifest
@@ -681,27 +767,34 @@ export class SyncEngine {
   }
 
   async followPeer(): Promise<void> {
-    const peers = [...this.lastPresenceByPeerId.entries()].map(([peerId, pos]) => ({
-      peerId,
-      name: this.peers.get(peerId) || `Peer-${peerId.slice(0, 4)}`,
-      pos,
-    }));
-    if (peers.length === 0) {
-      vscode.window.showInformationMessage('LineSync: No peer positions yet.');
-      return;
+    const peerId = await this.pickPeerForFollow('LineSync: Follow peer');
+    if (!peerId) return;
+    await this.revealPeerPosition(peerId, false);
+  }
+
+  isFocusFollowModeActive(): boolean {
+    return !!this.focusFollowPeerId;
+  }
+
+  async startFocusFollowMode(): Promise<boolean> {
+    const peerId = await this.pickPeerForFollow('LineSync: Focus follow peer');
+    if (!peerId) return false;
+    this.focusFollowPeerId = peerId;
+    this.focusFollowLastPosKey = '';
+    await this.revealPeerPosition(peerId, true);
+    const peerName = this.peers.get(peerId) || `Peer-${peerId.slice(0, 4)}`;
+    vscode.window.showInformationMessage(`LineSync: Focus follow enabled for ${peerName}.`);
+    return true;
+  }
+
+  stopFocusFollowMode(showMessage = true) {
+    this.focusFollowPeerId = null;
+    this.focusFollowLastPosKey = '';
+    if (this.focusFollowTimer) {
+      clearTimeout(this.focusFollowTimer);
+      this.focusFollowTimer = null;
     }
-    const pick = await vscode.window.showQuickPick(
-      peers.map((p) => ({ label: p.name, description: `${p.pos.file}:${p.pos.line + 1}:${p.pos.character + 1}`, p })),
-      { placeHolder: 'LineSync: Follow peer' }
-    );
-    if (!pick) return;
-    const target = pick.p.pos;
-    const uri = vscode.Uri.file(path.join(this.root, target.file));
-    const doc = await vscode.workspace.openTextDocument(uri);
-    const editor = await vscode.window.showTextDocument(doc, { preview: false });
-    const pos = new vscode.Position(target.line, target.character);
-    editor.selection = new vscode.Selection(pos, pos);
-    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    if (showMessage) vscode.window.showInformationMessage('LineSync: Focus follow disabled.');
   }
 
   async resyncFile(uri: vscode.Uri): Promise<{ ok: boolean; file?: string; reason?: string }> {
@@ -716,6 +809,7 @@ export class SyncEngine {
   }
 
   private async sendManifest() {
+    if (!this.isHost) return;
     const now = Date.now();
     if (now - this.lastManifestSentAt < 1000) return;
     this.lastManifestSentAt = now;
@@ -746,6 +840,7 @@ export class SyncEngine {
   }
 
   private reconcileWithRemoteManifest() {
+    if (this.remoteFilesMode !== 'autoMirrorMissing') return;
     for (const item of this.remoteManifest) {
       const rel = this.normalizeRelativePath(item.file);
       if (!rel || this.isIgnored(rel)) continue;
@@ -1079,6 +1174,8 @@ export class SyncEngine {
     const peerMode = cfg.get<string>('peerMode')
       ?? cfg.get<string>('guestMode', 'edit');
     this.peerMode = peerMode === 'readOnly' ? 'readOnly' : 'edit';
+    const remoteFilesMode = cfg.get<string>('remoteFilesMode', 'previewOnly');
+    this.remoteFilesMode = remoteFilesMode === 'autoMirrorMissing' ? 'autoMirrorMissing' : 'previewOnly';
     this.autoResyncOnDrift = cfg.get<boolean>('autoResyncOnDrift', true) ?? true;
     this.driftCheckIntervalMs = this.clampInt(cfg.get<number>('driftCheckIntervalMs', 2500) ?? 2500, 1000, 20_000);
     this.autoResyncCooldownMs = this.clampInt(cfg.get<number>('autoResyncCooldownMs', 15000) ?? 15000, 2000, 120_000);
@@ -1092,9 +1189,78 @@ export class SyncEngine {
 
   private startManifestSync() {
     if (this.manifestSyncTimer) clearInterval(this.manifestSyncTimer);
+    if (this.sessionMode !== 'guest') return;
     this.manifestSyncTimer = setInterval(() => {
-      void this.requestManifest();
-    }, 12_000);
+      if (!this.initialManifestReceived || Date.now() - this.manifestRequestedAt > 15_000) {
+        void this.requestManifest();
+      }
+    }, 30_000);
+  }
+
+  private async pickPeerForFollow(placeHolder: string): Promise<string | null> {
+    const peers = [...this.lastPresenceByPeerId.entries()].map(([peerId, pos]) => ({
+      peerId,
+      name: this.peers.get(peerId) || `Peer-${peerId.slice(0, 4)}`,
+      pos,
+    }));
+    if (peers.length === 0) {
+      vscode.window.showInformationMessage('LineSync: No peer positions yet.');
+      return null;
+    }
+    const pick = await vscode.window.showQuickPick(
+      peers.map((p) => ({ label: p.name, description: `${p.pos.file}:${p.pos.line + 1}:${p.pos.character + 1}`, p })),
+      { placeHolder }
+    );
+    if (!pick) return null;
+    return pick.p.peerId;
+  }
+
+  private async revealPeerPosition(peerId: string, preview: boolean): Promise<boolean> {
+    const target = this.lastPresenceByPeerId.get(peerId);
+    if (!target) return false;
+    const safe = this.safeWorkspacePath(target.file);
+    if (!safe) {
+      vscode.window.showWarningMessage('LineSync: Peer path is outside your workspace.');
+      return false;
+    }
+    const uri = vscode.Uri.file(safe.abs);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    const editor = await vscode.window.showTextDocument(doc, { preview, preserveFocus: false });
+    const line = Math.max(0, Math.min(target.line, Math.max(0, doc.lineCount - 1)));
+    const lineLen = doc.lineAt(line).text.length;
+    const ch = Math.max(0, Math.min(target.character, lineLen));
+    const pos = new vscode.Position(line, ch);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    return true;
+  }
+
+  private scheduleFocusFollowUpdate() {
+    if (!this.focusFollowPeerId) return;
+    if (this.focusFollowTimer) return;
+    this.focusFollowTimer = setTimeout(() => {
+      this.focusFollowTimer = null;
+      this.runFocusFollowUpdate().catch(() => {});
+    }, 80);
+  }
+
+  private async runFocusFollowUpdate() {
+    const peerId = this.focusFollowPeerId;
+    if (!peerId || this.focusFollowInFlight) return;
+    const pos = this.lastPresenceByPeerId.get(peerId);
+    if (!pos) {
+      this.stopFocusFollowMode(false);
+      return;
+    }
+    const posKey = `${pos.file}:${pos.line}:${pos.character}`;
+    if (posKey === this.focusFollowLastPosKey) return;
+    this.focusFollowInFlight = true;
+    try {
+      const moved = await this.revealPeerPosition(peerId, true);
+      if (moved) this.focusFollowLastPosKey = posKey;
+    } finally {
+      this.focusFollowInFlight = false;
+    }
   }
 
   private runDriftSweep() {

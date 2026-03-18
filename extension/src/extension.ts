@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import { IgnoreMatcher } from './ignoreMatcher';
 import { DecorationManager } from './decorationManager';
+import { FilePresenceDecorations } from './filePresenceDecorations';
 import WebSocket from 'ws';
 import { Transport } from './transport';
 import { SyncEngine } from './syncEngine';
@@ -15,6 +16,7 @@ import {
 let transport: Transport | undefined;
 let engine: SyncEngine | undefined;
 let decorationManager: DecorationManager | undefined;
+let filePresenceDecorations: FilePresenceDecorations | undefined;
 let output: vscode.OutputChannel | undefined;
 let paused = false;
 let extContext: vscode.ExtensionContext | undefined;
@@ -47,6 +49,9 @@ type RelayProbeSummary = {
 
 export function activate(context: vscode.ExtensionContext) {
   decorationManager = new DecorationManager(context);
+  filePresenceDecorations = new FilePresenceDecorations(decorationManager);
+  context.subscriptions.push(vscode.window.registerFileDecorationProvider(filePresenceDecorations));
+  context.subscriptions.push(filePresenceDecorations);
   output = vscode.window.createOutputChannel('LineSync');
   context.subscriptions.push(output);
   extContext = context;
@@ -56,6 +61,7 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar.command = 'linesync.showMenu';
   context.subscriptions.push(statusBar);
   setActiveUi(false);
+  void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', false);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('linesync.startSession', async () => {
@@ -69,8 +75,9 @@ export function activate(context: vscode.ExtensionContext) {
       if (!await checkConfig()) return;
 
       const sessionTokenInput = await vscode.window.showInputBox({
-        prompt: 'Enter token',
-        placeHolder: 'Token',
+        title: 'Join LineSync Session',
+        prompt: 'Session token',
+        placeHolder: 'Paste token',
         password: true,
         ignoreFocusOut: true,
         validateInput: (v) => {
@@ -86,7 +93,13 @@ export function activate(context: vscode.ExtensionContext) {
       if (currentMode === 'host' && currentRelayUrl && currentJoinToken) {
         try {
           const relaySecret = vscode.workspace.getConfiguration('linesync').get<string>('relaySecret', '') ?? '';
-          await revokeSessionTokenOnRelay(currentRelayUrl, currentJoinToken, relaySecret, 2500);
+          await revokeSessionTokenOnRelay(
+            currentRelayUrl,
+            currentJoinToken,
+            relaySecret,
+            2500,
+            isLocalWsRelay(currentRelayUrl)
+          );
         } catch {
           // best-effort revocation
         }
@@ -96,6 +109,7 @@ export function activate(context: vscode.ExtensionContext) {
       engine?.dispose();
       engine = undefined;
       decorationManager?.clearAll();
+      filePresenceDecorations?.setPresenceByFile(new Map());
       paused = false;
       extContext?.globalState.update('linesync.paused', false);
       peerCount = 0;
@@ -104,6 +118,7 @@ export function activate(context: vscode.ExtensionContext) {
       currentMode = undefined;
       currentJoinToken = undefined;
       currentSessionId = undefined;
+      void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', false);
       setActiveUi(false);
       vscode.window.showInformationMessage('LineSync: Disconnected');
     }),
@@ -136,6 +151,22 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       await engine.followPeer();
+    }),
+
+    vscode.commands.registerCommand('linesync.toggleFocusFollow', async () => {
+      if (!engine) {
+        vscode.window.showInformationMessage('LineSync: Not currently in a session');
+        return;
+      }
+      if (engine.isFocusFollowModeActive()) {
+        engine.stopFocusFollowMode(true);
+        void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', false);
+        setActiveUi(!!transport);
+        return;
+      }
+      const enabled = await engine.startFocusFollowMode();
+      void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', enabled);
+      setActiveUi(!!transport);
     }),
 
     vscode.commands.registerCommand('linesync.resyncFile', async (resource?: vscode.Uri) => {
@@ -185,17 +216,23 @@ export function activate(context: vscode.ExtensionContext) {
       if (!isConnected) {
         picks.push(
           { label: '$(broadcast) Start Session', id: 'start', description: 'Create a new private session' },
-          { label: '$(plug) Join Session', id: 'join', description: 'Enter a session token' },
+          { label: '$(plug) Join Session', id: 'join', description: 'Join with a session token' },
           { label: '$(gear) Open Settings', id: 'settings' },
         );
       } else {
+        const focusFollowActive = engine?.isFocusFollowModeActive() ?? false;
         if (currentMode === 'host') {
           picks.push({ label: '$(mail) Copy Session Token', id: 'copyInvite', description: 'Share to invite someone' });
         }
         picks.push(
-          { label: '$(file) Browse Shared Files', id: 'browseRemote', description: 'Request file list from host' },
+          { label: '$(file) Browse Shared Files', id: 'browseRemote', description: 'Open peer files on demand' },
           { label: '$(eye) Follow Peer', id: 'followPeer', description: 'Jump to a peer cursor' },
-          { label: '$(sync) Resync Active File', id: 'resyncActive' },
+          {
+            label: focusFollowActive ? '$(debug-stop) Stop Focus Follow' : '$(target) Start Focus Follow',
+            id: 'toggleFocusFollow',
+            description: focusFollowActive ? 'Stop auto-following a peer' : 'Keep viewport synced to one peer',
+          },
+          { label: '$(sync) Resync Active File', id: 'resyncActive', description: 'Request a safe file snapshot' },
           { label: '$(stop) Disconnect', id: 'disconnect' },
         );
       }
@@ -210,6 +247,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (pick.id === 'join') vscode.commands.executeCommand('linesync.joinSession');
       if (pick.id === 'browseRemote') engine?.showRemoteFileBrowser();
       if (pick.id === 'followPeer') engine?.followPeer();
+      if (pick.id === 'toggleFocusFollow') vscode.commands.executeCommand('linesync.toggleFocusFollow');
       if (pick.id === 'resyncActive') vscode.commands.executeCommand('linesync.resyncFile');
       if (pick.id === 'settings') vscode.commands.executeCommand('linesync.openSettings');
     })
@@ -221,7 +259,7 @@ function setActiveUi(active: boolean) {
   vscode.commands.executeCommand('setContext', 'linesync.active', active);
   if (!statusBar) return;
   if (!active) {
-    statusBar.text = '$(broadcast) LineSync';
+    statusBar.text = '$(radio-tower) LineSync';
     statusBar.tooltip = 'LineSync: Disconnected\nClick to open LineSync menu';
     statusBar.show();
     return;
@@ -234,12 +272,15 @@ function setActiveUi(active: boolean) {
     : relay.includes('linesync-sg') ? 'APAC'
     : relay.startsWith('wss://') || relay.startsWith('ws://') ? 'Custom'
     : '';
-  const roleLabel = currentMode === 'guest' ? 'peer' : (currentMode ?? '');
+  const roleLabel = currentMode === 'guest' ? 'Peer' : currentMode === 'host' ? 'Host' : '';
   const regionText = relayRegion ? ` ${relayRegion}` : '';
-  statusBar.text = `$(radio-tower) LineSync${regionText}  ${peersText}${rttText}`.trim();
+  const roleText = roleLabel ? ` ${roleLabel}` : '';
+  const focusFollowText = engine?.isFocusFollowModeActive() ? '  FF' : '';
+  statusBar.text = `$(radio-tower) LineSync${regionText}${roleText}  ${peersText}${rttText}${focusFollowText}`.trim();
   statusBar.tooltip = [
     `LineSync: Connected${relayRegion ? ` (${relayRegion})` : ''}`,
     roleLabel ? `Role: ${roleLabel}` : null,
+    engine?.isFocusFollowModeActive() ? 'Focus Follow: On' : null,
     `Peers: ${peerCount}`,
     lastRttMs !== null ? `RTT: ${Math.round(lastRttMs)} ms` : null,
     '',
@@ -252,9 +293,10 @@ export function deactivate() {
   transport?.disconnect();
   engine?.dispose();
   decorationManager?.dispose();
+  filePresenceDecorations?.dispose();
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// Helpers
 
 async function startSession(
   context: vscode.ExtensionContext,
@@ -267,6 +309,8 @@ async function startSession(
     engine?.dispose();
     engine = undefined;
     decorationManager?.clearAll();
+    filePresenceDecorations?.setPresenceByFile(new Map());
+    void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', false);
   }
 
   const cfg = vscode.workspace.getConfiguration('linesync');
@@ -275,12 +319,14 @@ async function startSession(
   let sessionId = '';
   let sessionSecret = '';
   let sessionToken = '';
+  let allowInsecureRelay = false;
 
   if (mode === 'host') {
     relayUrl = await resolveRelayUrlForHost(context, cfg);
     if (!relayUrl) return;
+    allowInsecureRelay = isLocalWsRelay(relayUrl);
     try {
-      const issued = await issueSessionToken(relayUrl, relaySecret, 3500);
+      const issued = await issueSessionToken(relayUrl, relaySecret, 3500, allowInsecureRelay);
       sessionId = issued.sessionId;
       sessionSecret = issued.sessionSecret;
       sessionToken = issued.token;
@@ -305,7 +351,13 @@ async function startSession(
       async () => {
         for (const candidate of relayCandidates) {
           try {
-            const result = await resolveSessionTokenOnRelay(candidate, token, relaySecret, 3000);
+            const result = await resolveSessionTokenOnRelay(
+              candidate,
+              token,
+              relaySecret,
+              3000,
+              isLocalWsRelay(candidate)
+            );
             return { relayUrl: candidate, result };
           } catch {
             // try next relay candidate
@@ -319,6 +371,7 @@ async function startSession(
       return;
     }
     relayUrl = resolved.relayUrl;
+    allowInsecureRelay = isLocalWsRelay(relayUrl);
     sessionId = resolved.result.sessionId;
     sessionSecret = resolved.result.sessionSecret;
     sessionToken = token;
@@ -352,6 +405,7 @@ async function startSession(
         sessionSecret,
         relaySecret,
         clientToken,
+        allowInsecureRelay,
         (e) => {
           if (e.type === 'session_info') {
             peerCount = (Array.isArray(e.peers) ? e.peers.length : 0) + 1;
@@ -371,7 +425,15 @@ async function startSession(
           engine?.handleTransportEvent(e);
         }
       );
-      engine = new SyncEngine(transport, userName, decorationManager!, context, sessionId, mode);
+      engine = new SyncEngine(
+        transport,
+        userName,
+        decorationManager!,
+        context,
+        sessionId,
+        mode,
+        (presenceByFile) => filePresenceDecorations?.setPresenceByFile(presenceByFile)
+      );
       engine.attach();
       token.onCancellationRequested(() => transport?.disconnect());
       await transport!.connect();
@@ -379,17 +441,15 @@ async function startSession(
 
     await context.globalState.update(LAST_GOOD_RELAY_KEY, relayUrl);
     setActiveUi(true);
+    void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', false);
     
     if (mode === 'host') {
       const sessionToken = currentJoinToken ?? '';
-      if (sessionToken) {
-        await vscode.env.clipboard.writeText(sessionToken);
-      }
       const action = await vscode.window.showInformationMessage(
-        'LineSync: Session token copied. Share it to invite someone.',
-        'Copy again'
+        'LineSync: Session is ready. Token is hidden and not copied automatically.',
+        'Copy token'
       );
-      if (action === 'Copy again' && sessionToken) {
+      if (action === 'Copy token' && sessionToken) {
         await vscode.env.clipboard.writeText(sessionToken);
       }
     } else {
@@ -400,7 +460,7 @@ async function startSession(
     vscode.window.showErrorMessage(`LineSync: Failed to connect - ${msg}`);
     if (mode === 'host' && relayUrl && sessionToken) {
       try {
-        await revokeSessionTokenOnRelay(relayUrl, sessionToken, relaySecret, 2500);
+        await revokeSessionTokenOnRelay(relayUrl, sessionToken, relaySecret, 2500, allowInsecureRelay);
       } catch {
         // best-effort rollback
       }
@@ -408,12 +468,14 @@ async function startSession(
     transport = undefined;
     engine?.dispose();
     engine = undefined;
+    filePresenceDecorations?.setPresenceByFile(new Map());
     currentRelayUrl = undefined;
     currentMode = undefined;
     currentSessionId = undefined;
     currentJoinToken = undefined;
     peerCount = 0;
     lastRttMs = null;
+    void vscode.commands.executeCommand('setContext', 'linesync.focusFollow', false);
     setActiveUi(false);
   }
 }
@@ -522,6 +584,12 @@ function validateRelayUrl(url: string | undefined): string | undefined {
     }
   }
   return u;
+}
+
+function isLocalWsRelay(url: string): boolean {
+  if (!url.startsWith('ws://')) return false;
+  const host = url.slice('ws://'.length).split('/')[0].split(':')[0].toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
 }
 
 function probeRelay(url: string, timeoutMs: number): Promise<number> {

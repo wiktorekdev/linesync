@@ -13,10 +13,17 @@ class TokenStore {
   constructor(opts = {}) {
     this.tokens = new Map();
     this.defaultTtlMs = Number(opts.defaultTtlMs) > 0 ? Number(opts.defaultTtlMs) : DEFAULT_TOKEN_TTL_MS;
+    this.maxTokens = Number(opts.maxTokens) > 0 ? Math.floor(Number(opts.maxTokens)) : Number.POSITIVE_INFINITY;
     this.hydrate(opts.initialRows || []);
   }
 
   issue() {
+    if (this.tokens.size >= this.maxTokens) {
+      const err = new Error('token_store_full');
+      err.code = 'token_store_full';
+      throw err;
+    }
+
     let token = randomSessionToken();
     while (this.tokens.has(token)) {
       token = randomSessionToken();
@@ -83,6 +90,8 @@ class TokenStore {
     if (!Array.isArray(rows)) return;
     const now = Date.now();
     for (const row of rows) {
+      if (this.tokens.size >= this.maxTokens) break;
+
       const token = String(row && row.token || '').trim();
       const sessionId = normalizeSessionId(row && row.sessionId);
       const sessionSecret = String(row && row.sessionSecret || '').trim();

@@ -43,10 +43,22 @@ function hasRelaySecret(req, configuredSecret) {
   return provided && provided === configuredSecret;
 }
 
-function remoteIpFromReq(req) {
-  return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
-    .split(',')[0]
-    .trim();
+function rejectUnauthorized(res, remoteIp, authFailLimiter, scope = 'http') {
+  const key = `${scope}:${remoteIp}`;
+  const limited = !!(authFailLimiter && authFailLimiter.hit(key));
+  sendJson(res, limited ? 429 : 401, { error: limited ? 'auth_rate_limited' : 'unauthorized' });
+}
+
+function normalizeIp(raw) {
+  const ip = String(raw || '').trim().slice(0, 128);
+  return ip || 'unknown';
+}
+
+function remoteIpFromReq(req, trustProxy = false) {
+  if (trustProxy) {
+    return normalizeIp(String(req.headers['x-forwarded-for'] || '').split(',')[0]);
+  }
+  return normalizeIp(req.socket.remoteAddress);
 }
 
 function createHttpHandler(opts) {
@@ -55,13 +67,16 @@ function createHttpHandler(opts) {
     sessionStore,
     tokenStore,
     joinLimiter,
+    tokenApiLimiter,
+    authFailLimiter,
     onStateChanged,
+    trustProxy,
   } = opts;
 
   return async (req, res) => {
     const parsed = url.parse(req.url || '', true);
     const pathName = parsed.pathname || '';
-    const remoteIp = remoteIpFromReq(req);
+    const remoteIp = remoteIpFromReq(req, trustProxy);
 
     if ((req.method === 'GET' || req.method === 'HEAD') && pathName === '/health') {
       if (req.method === 'HEAD') {
@@ -102,20 +117,43 @@ function createHttpHandler(opts) {
     }
 
     if (req.method === 'POST' && pathName === '/session-token') {
-      if (!hasRelaySecret(req, secret)) {
-        sendJson(res, 401, { error: 'unauthorized' });
+      if (tokenApiLimiter && tokenApiLimiter.hit(remoteIp)) {
+        sendJson(res, 429, { error: 'rate_limited' });
         return;
       }
-      const issued = tokenStore.issue();
-      sessionStore.ensure(issued.sessionId);
+      if (!hasRelaySecret(req, secret)) {
+        rejectUnauthorized(res, remoteIp, authFailLimiter, 'http');
+        return;
+      }
+
+      let issued;
+      try {
+        issued = tokenStore.issue();
+      } catch (err) {
+        if (err && err.code === 'token_store_full') {
+          sendJson(res, 503, { error: 'token_store_full' });
+          return;
+        }
+        throw err;
+      }
+      const session = sessionStore.ensure(issued.sessionId);
+      if (!session) {
+        tokenStore.revoke(issued.token);
+        sendJson(res, 503, { error: 'session_store_full' });
+        return;
+      }
       onStateChanged({ immediate: true });
       sendJson(res, 200, issued);
       return;
     }
 
     if (req.method === 'POST' && pathName === '/session-token/resolve') {
+      if (tokenApiLimiter && tokenApiLimiter.hit(remoteIp)) {
+        sendJson(res, 429, { error: 'rate_limited' });
+        return;
+      }
       if (!hasRelaySecret(req, secret)) {
-        sendJson(res, 401, { error: 'unauthorized' });
+        rejectUnauthorized(res, remoteIp, authFailLimiter, 'http');
         return;
       }
       let body;
@@ -145,8 +183,12 @@ function createHttpHandler(opts) {
     }
 
     if (req.method === 'POST' && pathName === '/session-token/revoke') {
+      if (tokenApiLimiter && tokenApiLimiter.hit(remoteIp)) {
+        sendJson(res, 429, { error: 'rate_limited' });
+        return;
+      }
       if (!hasRelaySecret(req, secret)) {
-        sendJson(res, 401, { error: 'unauthorized' });
+        rejectUnauthorized(res, remoteIp, authFailLimiter, 'http');
         return;
       }
       let body;

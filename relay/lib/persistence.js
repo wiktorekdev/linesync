@@ -35,7 +35,7 @@ class StatePersistence {
     const dir = path.dirname(this.filePath);
     const tmp = `${this.filePath}.tmp`;
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, this.filePath);
   }
 }

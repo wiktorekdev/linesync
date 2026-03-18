@@ -2,15 +2,16 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 
 const PALETTE = [
-  { bg: 'rgba(78,201,176,0.14)',  ruler: '#4ec9b0', cursor: '#4ec9b0', label: 'rgba(78,201,176,0.8)'  },
-  { bg: 'rgba(244,135,113,0.14)', ruler: '#f48771', cursor: '#f48771', label: 'rgba(244,135,113,0.8)' },
-  { bg: 'rgba(86,156,214,0.14)',  ruler: '#569cd6', cursor: '#569cd6', label: 'rgba(86,156,214,0.8)'  },
-  { bg: 'rgba(206,145,120,0.14)', ruler: '#ce9178', cursor: '#ce9178', label: 'rgba(206,145,120,0.8)' },
-  { bg: 'rgba(197,134,192,0.14)', ruler: '#c586c0', cursor: '#c586c0', label: 'rgba(197,134,192,0.8)' },
-  { bg: 'rgba(220,220,170,0.14)', ruler: '#dcdcaa', cursor: '#dcdcaa', label: 'rgba(220,220,170,0.8)' },
+  { bg: 'rgba(78,201,176,0.14)',  ruler: '#4ec9b0', cursor: '#4ec9b0', label: 'rgba(78,201,176,0.8)',  theme: 'charts.green' },
+  { bg: 'rgba(244,135,113,0.14)', ruler: '#f48771', cursor: '#f48771', label: 'rgba(244,135,113,0.8)', theme: 'charts.red' },
+  { bg: 'rgba(86,156,214,0.14)',  ruler: '#569cd6', cursor: '#569cd6', label: 'rgba(86,156,214,0.8)',  theme: 'charts.blue' },
+  { bg: 'rgba(206,145,120,0.14)', ruler: '#ce9178', cursor: '#ce9178', label: 'rgba(206,145,120,0.8)', theme: 'charts.orange' },
+  { bg: 'rgba(197,134,192,0.14)', ruler: '#c586c0', cursor: '#c586c0', label: 'rgba(197,134,192,0.8)', theme: 'charts.purple' },
+  { bg: 'rgba(220,220,170,0.14)', ruler: '#dcdcaa', cursor: '#dcdcaa', label: 'rgba(220,220,170,0.8)', theme: 'charts.yellow' },
 ];
 
 type PeerDecorationsStyle = 'full' | 'git' | 'minimal';
+type PeerSelectionStyle = 'native' | 'soft' | 'strong';
 
 function clamp01(v: number): number {
   if (!Number.isFinite(v)) return 0;
@@ -27,25 +28,26 @@ function rgbaFromBase(base: string, alpha: number): string {
 
 function getDecorConfig() {
   const cfg = vscode.workspace.getConfiguration('linesync');
-  const styleRaw = cfg.get<string>('peerDecorationsStyle', 'git');
+  const styleRaw = cfg.get<string>('peerDecorationsStyle', 'minimal');
   const style: PeerDecorationsStyle = styleRaw === 'full' || styleRaw === 'minimal' || styleRaw === 'git'
     ? styleRaw
     : 'git';
+  const selectionStyleRaw = cfg.get<string>('peerSelectionStyle', 'native');
+  const selectionStyle: PeerSelectionStyle = selectionStyleRaw === 'native' || selectionStyleRaw === 'soft' || selectionStyleRaw === 'strong'
+    ? selectionStyleRaw
+    : 'native';
   const showChangedLabel = cfg.get<boolean>('peerShowChangedLineLabel') ?? false;
-  const showCursorLabel = cfg.get<boolean>('peerShowCursorLabel') ?? true;
-  const showCursorCoords = cfg.get<boolean>('peerShowCursorCoords') ?? true;
+  const peerCursorBlink = cfg.get<boolean>('peerCursorBlink') ?? true;
   const selOpacityRaw = cfg.get<number>('peerSelectionOpacity') ?? 0.12;
   const selectionOpacity = clamp01(selOpacityRaw);
-  return { style, showChangedLabel, showCursorLabel, showCursorCoords, selectionOpacity };
+  return { style, selectionStyle, showChangedLabel, peerCursorBlink, selectionOpacity };
 }
 
 interface PeerState {
   name: string;
   colorIdx: number;
   lineType: vscode.TextEditorDecorationType;
-  cursorInlineType: vscode.TextEditorDecorationType;
-  cursorLineType: vscode.TextEditorDecorationType;
-  cursorLabelType: vscode.TextEditorDecorationType;
+  cursorType: vscode.TextEditorDecorationType;
   selectionType: vscode.TextEditorDecorationType;
   // relativePath -> changed line numbers
   changedLines: Map<string, number[]>;
@@ -62,6 +64,8 @@ export class DecorationManager {
   private workspaceRoot: string;
   private disposables: vscode.Disposable[] = [];
   private decorCfg = getDecorConfig();
+  private cursorBlinkTimer: ReturnType<typeof setInterval> | null = null;
+  private cursorVisible = true;
 
   constructor(private context: vscode.ExtensionContext) {
     this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
@@ -70,11 +74,12 @@ export class DecorationManager {
       vscode.window.onDidChangeActiveTextEditor(() => this.refreshAll()),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('linesync.peerDecorationsStyle')
+          || e.affectsConfiguration('linesync.peerSelectionStyle')
           || e.affectsConfiguration('linesync.peerShowChangedLineLabel')
-          || e.affectsConfiguration('linesync.peerShowCursorLabel')
-          || e.affectsConfiguration('linesync.peerShowCursorCoords')
+          || e.affectsConfiguration('linesync.peerCursorBlink')
           || e.affectsConfiguration('linesync.peerSelectionOpacity')) {
           this.decorCfg = getDecorConfig();
+          this.resetCursorBlink();
           for (const peer of this.peers.values()) this.rebuildPeerTypes(peer);
           this.refreshAll();
         }
@@ -83,6 +88,7 @@ export class DecorationManager {
         this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
       })
     );
+    this.resetCursorBlink();
   }
 
   // Public API
@@ -141,16 +147,12 @@ export class DecorationManager {
     // Remove decorations from all editors before disposing types
     for (const editor of vscode.window.visibleTextEditors) {
       editor.setDecorations(peer.lineType, []);
-      editor.setDecorations(peer.cursorInlineType, []);
-      editor.setDecorations(peer.cursorLineType, []);
-      editor.setDecorations(peer.cursorLabelType, []);
+      editor.setDecorations(peer.cursorType, []);
       editor.setDecorations(peer.selectionType, []);
     }
 
     peer.lineType.dispose();
-    peer.cursorInlineType.dispose();
-    peer.cursorLineType.dispose();
-    peer.cursorLabelType.dispose();
+    peer.cursorType.dispose();
     peer.selectionType.dispose();
     peer.clearTimer.forEach((t) => clearTimeout(t));
     this.peers.delete(peerId);
@@ -163,8 +165,22 @@ export class DecorationManager {
   }
 
   dispose() {
+    if (this.cursorBlinkTimer) {
+      clearInterval(this.cursorBlinkTimer);
+      this.cursorBlinkTimer = null;
+    }
     this.clearAll();
     this.disposables.forEach((d) => d.dispose());
+  }
+
+  getPeerThemeColorId(peerId: string): string | undefined {
+    const peer = this.peers.get(peerId);
+    if (!peer) return undefined;
+    return PALETTE[peer.colorIdx % PALETTE.length].theme;
+  }
+
+  getPeerName(peerId: string): string | undefined {
+    return this.peers.get(peerId)?.name;
   }
 
   // Internals
@@ -181,15 +197,12 @@ export class DecorationManager {
 
     const colorIdx = this.nextColor % PALETTE.length;
     this.nextColor++;
-    const c = PALETTE[colorIdx];
 
     const peer: PeerState = {
       name: (peerName || '').trim() || 'Peer',
       colorIdx,
       lineType: vscode.window.createTextEditorDecorationType({}),
-      cursorInlineType: vscode.window.createTextEditorDecorationType({}),
-      cursorLineType: vscode.window.createTextEditorDecorationType({}),
-      cursorLabelType: vscode.window.createTextEditorDecorationType({}),
+      cursorType: vscode.window.createTextEditorDecorationType({}),
       selectionType: vscode.window.createTextEditorDecorationType({}),
       changedLines: new Map(),
       clearTimer: new Map(),
@@ -208,9 +221,7 @@ export class DecorationManager {
     const cfg = this.decorCfg;
 
     peer.lineType.dispose();
-    peer.cursorInlineType.dispose();
-    peer.cursorLineType.dispose();
-    peer.cursorLabelType.dispose();
+    peer.cursorType.dispose();
     peer.selectionType.dispose();
 
     // Changed lines highlight
@@ -243,43 +254,22 @@ export class DecorationManager {
       });
     }
 
-    // Cursor: inline marker at the exact character (visible `|` like native caret).
-    peer.cursorInlineType = vscode.window.createTextEditorDecorationType({
-      before: {
-        contentText: '|',
-        color: c.cursor,
-        margin: '0 1px 0 0',
-      },
-      overviewRulerColor: c.ruler,
-      overviewRulerLane: vscode.OverviewRulerLane.Left,
-      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-    });
-
-    // Cursor fallback for empty lines: whole-line marker at line start.
-    peer.cursorLineType = vscode.window.createTextEditorDecorationType({
-      isWholeLine: true,
-      before: {
-        contentText: '|',
-        color: c.cursor,
-        margin: '0 2px 0 0',
-      },
-      overviewRulerColor: c.ruler,
-      overviewRulerLane: vscode.OverviewRulerLane.Left,
-    });
-
-    peer.cursorLabelType = vscode.window.createTextEditorDecorationType({
+    peer.cursorType = vscode.window.createTextEditorDecorationType({
+      backgroundColor: 'transparent',
+      borderColor: c.cursor,
+      borderStyle: 'solid',
+      borderWidth: '0 0 0 2px',
       overviewRulerColor: c.ruler,
       overviewRulerLane: vscode.OverviewRulerLane.Left,
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     });
 
     peer.selectionType = vscode.window.createTextEditorDecorationType({
-      // Subtle “box” around the peer selection, centered on the selected range.
-      backgroundColor: rgbaFromBase(c.bg, cfg.selectionOpacity),
-      borderColor: c.cursor,
-      borderStyle: 'solid',
-      borderWidth: '1px',
-      borderRadius: '2px',
+      backgroundColor: rgbaFromBase(c.bg, this.selectionOpacityForStyle(cfg.selectionStyle, cfg.selectionOpacity)),
+      borderColor: cfg.selectionStyle === 'strong' ? c.cursor : undefined,
+      borderStyle: cfg.selectionStyle === 'strong' ? 'solid' : undefined,
+      borderWidth: cfg.selectionStyle === 'strong' ? '1px' : undefined,
+      borderRadius: cfg.selectionStyle === 'strong' ? '2px' : undefined,
     });
   }
 
@@ -298,42 +288,18 @@ export class DecorationManager {
       );
 
       // Remote cursor indicator
-      const cursorInlineRanges: vscode.Range[] = [];
-      const cursorLineRanges: vscode.Range[] = [];
-      const cursorLabelRanges: vscode.DecorationOptions[] = [];
+      const cursorRanges: vscode.Range[] = [];
       if (peer.cursorFile === rel && peer.cursorLine >= 0 && lineCount > 0) {
         const l = Math.min(peer.cursorLine, lineCount - 1);
         const lineLen = editor.document.lineAt(l).text.length;
         const ch = Math.max(0, Math.min(peer.cursorCharacter, lineLen));
-
-        // Label/coords next to cursor, optional.
-        const cfg = this.decorCfg;
-        const parts: string[] = [];
-        if (cfg.showCursorLabel) parts.push(peer.name || 'Peer');
-        if (cfg.showCursorCoords) parts.push(`${l + 1}:${ch + 1}`);
-        if (parts.length > 0) {
-          const label = parts.join(' ');
-          cursorLabelRanges.push({
-            range: new vscode.Range(l, ch, l, ch),
-            renderOptions: {
-              after: {
-                contentText: `  ${label}`,
-                color: PALETTE[peer.colorIdx % PALETTE.length].label,
-                margin: '0 0 0 4px',
-              },
-            },
-          });
-        }
-
-        if (lineLen === 0) {
-          cursorLineRanges.push(new vscode.Range(l, 0, l, 0));
-        } else {
-          cursorInlineRanges.push(new vscode.Range(l, ch, l, ch));
+        if (this.cursorVisible) {
+          const start = ch < lineLen ? ch : Math.max(0, ch - 1);
+          const end = ch < lineLen ? ch + 1 : ch;
+          cursorRanges.push(new vscode.Range(l, start, l, end));
         }
       }
-      editor.setDecorations(peer.cursorInlineType, cursorInlineRanges);
-      editor.setDecorations(peer.cursorLineType, cursorLineRanges);
-      editor.setDecorations(peer.cursorLabelType, cursorLabelRanges.length ? cursorLabelRanges : []);
+      editor.setDecorations(peer.cursorType, cursorRanges);
 
       // Remote selection highlight
       const selectionRanges: vscode.Range[] = [];
@@ -355,6 +321,43 @@ export class DecorationManager {
     }
   }
 
+  private refreshCursorsOnly() {
+    for (const peer of this.peers.values()) {
+      for (const editor of vscode.window.visibleTextEditors) {
+        const rel = this.toRelative(editor.document.uri.fsPath);
+        const lineCount = editor.document.lineCount;
+        const cursorRanges: vscode.Range[] = [];
+        if (peer.cursorFile === rel && peer.cursorLine >= 0 && lineCount > 0 && this.cursorVisible) {
+          const l = Math.min(peer.cursorLine, lineCount - 1);
+          const lineLen = editor.document.lineAt(l).text.length;
+          const ch = Math.max(0, Math.min(peer.cursorCharacter, lineLen));
+          const start = ch < lineLen ? ch : Math.max(0, ch - 1);
+          const end = ch < lineLen ? ch + 1 : ch;
+          cursorRanges.push(new vscode.Range(l, start, l, end));
+        }
+        editor.setDecorations(peer.cursorType, cursorRanges);
+      }
+    }
+  }
+
+  private resetCursorBlink() {
+    if (this.cursorBlinkTimer) {
+      clearInterval(this.cursorBlinkTimer);
+      this.cursorBlinkTimer = null;
+    }
+    if (!this.decorCfg.peerCursorBlink) {
+      this.cursorVisible = true;
+      this.refreshCursorsOnly();
+      return;
+    }
+    this.cursorVisible = true;
+    this.cursorBlinkTimer = setInterval(() => {
+      if (this.peers.size === 0) return;
+      this.cursorVisible = !this.cursorVisible;
+      this.refreshCursorsOnly();
+    }, 700);
+  }
+
   private toRelative(fsPath: string): string {
     if (!this.workspaceRoot) return fsPath;
     return path.relative(this.workspaceRoot, fsPath).replace(/\\/g, '/');
@@ -366,5 +369,15 @@ export class DecorationManager {
     const lineLen = editor.document.lineAt(line).text.length;
     const ch = Math.max(0, Math.min(pos.character, lineLen));
     return new vscode.Position(line, ch);
+  }
+
+  private selectionOpacityForStyle(style: PeerSelectionStyle, configured: number): number {
+    if (style === 'native') {
+      return Math.min(0.09, configured);
+    }
+    if (style === 'strong') {
+      return Math.max(0.22, configured);
+    }
+    return Math.max(0.06, Math.min(0.18, configured));
   }
 }

@@ -5,7 +5,7 @@ import { decryptJson, deriveRelayPasswordHash, deriveSessionKey, encryptJson } f
 import type { EncEnvelope, JoinMessage, Payload } from './protocol';
 
 export type TransportEvent =
-  | { type: 'session_info'; peerId: string; peers: { peerId: string; peerName: string }[] }
+  | { type: 'session_info'; peerId: string; peers: { peerId: string; peerName: string }[]; isHost?: boolean; hostPeerId?: string | null }
   | { type: 'peer_joined'; peerId: string; peerName: string }
   | { type: 'peer_left'; peerId: string }
   | { type: 'rtt'; rttMs: number }
@@ -34,6 +34,7 @@ export class Transport {
     private sessionSecret: string,
     private relaySecret: string,
     private clientToken: string,
+    private allowInsecureRelay: boolean,
     private onEvent: (e: TransportEvent) => void
   ) {
     this.keyPromise = deriveSessionKey(sessionSecret, sessionId);
@@ -56,6 +57,10 @@ export class Transport {
       };
 
       try {
+        if (!this.allowInsecureRelay && this.relayUrl.startsWith('ws://')) {
+          safeReject(new Error('Insecure relay is blocked. Use wss:// (ws:// is allowed only for localhost).'));
+          return;
+        }
         this.ws = new WebSocket(this.relayUrl, {
           perMessageDeflate: { zlibDeflateOptions: { level: 6 }, threshold: 512 },
         });
@@ -90,7 +95,13 @@ export class Transport {
 
         if (msg.type === 'session_info') {
           clearTimeout(timeout);
-          this.onEvent({ type: 'session_info', peerId: String(msg.peerId || ''), peers: Array.isArray(msg.peers) ? msg.peers : [] });
+          this.onEvent({
+            type: 'session_info',
+            peerId: String(msg.peerId || ''),
+            peers: Array.isArray(msg.peers) ? msg.peers : [],
+            isHost: typeof msg.isHost === 'boolean' ? msg.isHost : undefined,
+            hostPeerId: typeof msg.hostPeerId === 'string' ? msg.hostPeerId : null,
+          });
           handshakeComplete = true;
           safeResolve();
           return;
@@ -228,6 +239,7 @@ function closeCodeToMessage(code: number): string {
     case 4002: return 'Session is full';
     case 4003: return 'Invalid session token';
     case 4004: return 'Session token is required';
+    case 4005: return 'Invalid client token';
     case 4007: return 'Disconnected: heartbeat timeout';
     case 4008: return 'Too many join attempts (rate limited)';
     case 4010: return 'You were removed from the session';
