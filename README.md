@@ -1,4 +1,4 @@
-# LineSync
+# LineSync (DiSCONTINUED)
 
 <div align="center">
 
